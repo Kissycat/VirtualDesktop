@@ -906,7 +906,7 @@ internal class FreeformOverlayDecoration(
         overlayAttached = false
     }
 
-    private fun closeWindow() {
+    internal fun closeWindow() {
         if (released || closing) return
         closing = true
         sessionScope.launch(Dispatchers.IO) {
@@ -942,6 +942,7 @@ internal class FreeformOverlayDecoration(
     }
 
     fun remove() = closeWindow()
+
 }
 
 private class ExitTriggerView(

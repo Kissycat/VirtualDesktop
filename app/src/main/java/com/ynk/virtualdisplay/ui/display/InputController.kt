@@ -1,5 +1,6 @@
 package com.ynk.virtualdisplay.ui.display
 
+import android.content.Context
 import android.graphics.RectF
 import android.util.Log
 import android.view.InputDevice
@@ -18,12 +19,36 @@ class InputController(
     private val repository: IDisplayRepository,
     private val displayIdProvider: () -> Int?,
     private val scope: CoroutineScope,
+    context: Context,
 ) {
 
     companion object {
         private const val TAG = "InputController"
+        private const val DESKTOP_PREFS = "desktop_shell_preferences"
+        private const val PREF_CURSOR_SENSITIVITY = "desktop_cursor_sensitivity_percent"
+        private const val PREF_SCROLL_SENSITIVITY = "desktop_scroll_sensitivity_percent"
+
+        @Volatile
+        private var desktopCursorSensitivityMultiplier = 1f
+
+        @Volatile
+        private var desktopScrollSensitivityMultiplier = 1f
+
+        fun setDesktopCursorSensitivityPercent(percent: Int) {
+            desktopCursorSensitivityMultiplier = ((100 + percent.coerceIn(-100, 100)) / 100f).coerceIn(0f, 2f)
+        }
+
+        fun setDesktopScrollSensitivityPercent(percent: Int) {
+            desktopScrollSensitivityMultiplier = ((100 + percent.coerceIn(-100, 100)) / 100f).coerceIn(0f, 2f)
+        }
         private const val POINTER_ID_MOUSE = -1L
         private const val ACTION_POINTER_INDEX_SHIFT = 8
+    }
+
+    init {
+        val prefs = context.getSharedPreferences(DESKTOP_PREFS, Context.MODE_PRIVATE)
+        setDesktopCursorSensitivityPercent(prefs.getInt(PREF_CURSOR_SENSITIVITY, 0))
+        setDesktopScrollSensitivityPercent(prefs.getInt(PREF_SCROLL_SENSITIVITY, 0))
     }
 
     enum class DisplayMode {
@@ -82,6 +107,10 @@ class InputController(
     private var trackpadTwoFinger = false
     private var trackpadTwoFingerHorizontal = false
     private var trackpadTwoFingerSwipeStarted = false
+    // Lock the direction of a two-finger scroll for the current gesture.
+    // Small pointer-index/centering jitter must not generate an opposite scroll.
+    private var trackpadTwoFingerScrollSignX = 0
+    private var trackpadTwoFingerScrollSignY = 0
     private var trackpadThreeFinger = false
     private var trackpadThreeFingerStartX = 0f
     private var trackpadThreeFingerStartY = 0f
@@ -111,7 +140,7 @@ class InputController(
         }
         pendingThreeFingerClick = false
     }
-    private val trackpadSensitivity = 0.72f
+    private val baseTrackpadSensitivity = 0.72f
     // Movement before the long-press deadline cancels tap/drag qualification.
     private val trackpadMoveThreshold = 26f
     // After a stationary long-press, this smaller movement starts a drag.
@@ -317,6 +346,8 @@ class InputController(
                 trackpadTwoFingerLastY = 0f
                 trackpadTwoFingerHorizontal = false
                 trackpadTwoFingerSwipeStarted = false
+                trackpadTwoFingerScrollSignX = 0
+                trackpadTwoFingerScrollSignY = 0
                 trackpadThreeFinger = false
                 trackpadThreeFingerMoved = false
                 trackpadThreeFingerClickTriggered = false
@@ -339,6 +370,8 @@ class InputController(
                         trackpadTwoFinger = false
                         trackpadTwoFingerHorizontal = false
                         trackpadTwoFingerSwipeStarted = false
+                        trackpadTwoFingerScrollSignX = 0
+                        trackpadTwoFingerScrollSignY = 0
                         trackpadTapCancelled = true
                         trackpadMoved = true
                         if (trackpadDragging) {
@@ -368,6 +401,8 @@ class InputController(
                         trackpadTwoFingerStartY = y
                         trackpadTwoFingerLastX = x
                         trackpadTwoFingerLastY = y
+                        trackpadTwoFingerScrollSignX = 0
+                        trackpadTwoFingerScrollSignY = 0
                         return true
                     }
                 }
@@ -413,13 +448,21 @@ class InputController(
                             val dx = x - trackpadTwoFingerLastX
                             if (kotlin.math.abs(dx) > 0.5f) {
                                 trackpadMoved = true
-                                routeTrackpadScrollOrMain(displayId, dx / 288f, 0f)
+                                routeTrackpadScrollOrMain(
+                                    displayId,
+                                    dx / 288f * desktopScrollSensitivityMultiplier,
+                                    0f
+                                )
                             }
                         } else {
                             val dy = y - trackpadTwoFingerLastY
                             if (kotlin.math.abs(dy) > 0.5f) {
                                 trackpadMoved = true
-                                routeTrackpadScrollOrMain(displayId, 0f, dy / 288f)
+                                routeTrackpadScrollOrMain(
+                                    displayId,
+                                    0f,
+                                    dy / 288f * desktopScrollSensitivityMultiplier
+                                )
                             }
                         }
                         trackpadTwoFingerLastX = x
@@ -466,8 +509,8 @@ class InputController(
                 }
 
                 if (dx != 0f || dy != 0f) {
-                    trackpadCursorX = (trackpadCursorX + dx * trackpadSensitivity).coerceIn(0f, videoWidth.toFloat())
-                    trackpadCursorY = (trackpadCursorY + dy * trackpadSensitivity).coerceIn(0f, videoHeight.toFloat())
+                    trackpadCursorX = (trackpadCursorX + dx * (baseTrackpadSensitivity * desktopCursorSensitivityMultiplier)).coerceIn(0f, videoWidth.toFloat())
+                    trackpadCursorY = (trackpadCursorY + dy * (baseTrackpadSensitivity * desktopCursorSensitivityMultiplier)).coerceIn(0f, videoHeight.toFloat())
                     DesktopCursorState.update(trackpadCursorX, trackpadCursorY, videoWidth, videoHeight)
 
                     if (!trackpadTwoFinger && trackpadLongPressStarted && !trackpadDragging) {
@@ -533,6 +576,8 @@ class InputController(
 
                 trackpadDoubleTapDragArmed = false
                 trackpadTwoFinger = false
+                trackpadTwoFingerScrollSignX = 0
+                trackpadTwoFingerScrollSignY = 0
                 trackpadDragging = false
                 trackpadMoved = false
                 trackpadTapCancelled = false
@@ -1066,7 +1111,26 @@ class InputController(
             injectScrollEvent(trackpadCursorX, trackpadCursorY, hScroll, vScroll, 0, displayId)
             return
         }
-        scope.launch(Dispatchers.Main.immediate) {
+        // Trackpad MOVE events already arrive on the UI thread. Consume drawer
+        // scrolling synchronously before any window/fullscreen route is allowed.
+        // This prevents two queued Main.immediate coroutines from fighting over
+        // consecutive scroll deltas and producing the visible direction jitter.
+        val drawerHandled = if (Looper.myLooper() == Looper.getMainLooper()) {
+            runCatching {
+                com.ynk.virtualdisplay.ui.desktop.DesktopShellActivity.dispatchScrollToDrawer(
+                    displayId = displayId,
+                    x = trackpadCursorX,
+                    y = trackpadCursorY,
+                    hScroll = hScroll,
+                    vScroll = vScroll,
+                )
+            }.getOrDefault(false)
+        } else {
+            false
+        }
+        if (drawerHandled) return
+
+        val route: suspend () -> Unit = {
             val routed = runCatching {
                 DesktopWindowInputRouter.injectScroll(
                     displayId = displayId, x = trackpadCursorX, y = trackpadCursorY,
@@ -1077,6 +1141,11 @@ class InputController(
             if (!routed) {
                 injectScrollEvent(trackpadCursorX, trackpadCursorY, hScroll, vScroll, 0, displayId)
             }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            scope.launch(Dispatchers.Main.immediate) { route() }
+        } else {
+            scope.launch(Dispatchers.Main.immediate) { route() }
         }
     }
 

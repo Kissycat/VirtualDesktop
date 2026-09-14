@@ -28,6 +28,7 @@ import android.widget.FrameLayout
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import android.util.Log
@@ -141,6 +142,17 @@ class DesktopShellActivity : ComponentActivity() {
         ): Boolean = instances[displayId]?.get()?.dispatchPointerToDrawerInternal(
             action, x, y, actionButton, buttons
         ) ?: false
+
+        /** Dispatch two-finger scroll into the drawer's active scroller. */
+        fun dispatchScrollToDrawer(
+            displayId: Int,
+            x: Float,
+            y: Float,
+            hScroll: Float,
+            vScroll: Float,
+        ): Boolean = instances[displayId]?.get()?.dispatchScrollToDrawerInternal(
+            x, y, hScroll, vScroll
+        ) ?: false
     }
 
     internal val displayInteractor: DisplayInteractor by inject()
@@ -166,6 +178,9 @@ class DesktopShellActivity : ComponentActivity() {
     private var drawerRightButtonLatched = false
     private var drawerLastGlobalX = Float.NaN
     private var drawerLastGlobalY = Float.NaN
+    private var drawerRecentScroll: android.widget.HorizontalScrollView? = null
+    private var drawerFullScroll: View? = null
+    private var contextMenuRequestSerial = 0L
     // The context menu is a separate PopupWindow overlay. Desktop mouse events are
     // injected manually, so the popup must participate in the same explicit
     // topmost hit-testing stack as the drawer and freeform windows.
@@ -580,7 +595,8 @@ class DesktopShellActivity : ComponentActivity() {
             return false
         }
 
-        if (!drawerExpanded &&
+        val contextMenuOpen = contextMenuPopup?.isShowing == true
+        if (!drawerExpanded && !contextMenuOpen &&
             (action == MotionEvent.ACTION_HOVER_MOVE || action == MotionEvent.ACTION_HOVER_ENTER)) {
             val previousY = drawerLastGlobalY
             val crossedTopEdge = !previousY.isNaN() &&
@@ -620,6 +636,51 @@ class DesktopShellActivity : ComponentActivity() {
             handled || drawerPointerLatched
         } finally {
             event.recycle()
+        }
+    }
+
+    private fun dispatchScrollToDrawerInternal(
+        x: Float,
+        y: Float,
+        hScroll: Float,
+        vScroll: Float,
+    ): Boolean {
+        val root = drawerOverlayRoot ?: return false
+        val params = drawerOverlayParams ?: return false
+        val targetDisplay = display ?: return false
+        val top = targetDisplay.height - params.height - params.y
+        val localX = x - params.x
+        val localY = y - top
+        val inside = localX >= 0f && localY >= 0f &&
+            localX < params.width.toFloat() && localY < params.height.toFloat()
+        if (!inside) return false
+
+        // The InputController supplies AXIS_* values derived from the finger
+        // delta (delta / 288). Do not reinterpret that value with a second
+        // animation step: apply one immediate pixel delta per sample. Touch
+        // scrolling convention is opposite the finger movement (drag right ->
+        // content moves left), so the sign is intentionally inverted here.
+        // A 2x gain restores the useful trackpad travel that the old wheel-style
+        // mapping lost, while the user preference multiplier remains effective.
+        val drawerGain = 2f
+        val deltaX = (-hScroll * dp(288) * drawerGain).roundToInt()
+        val deltaY = (-vScroll * dp(288) * drawerGain).roundToInt()
+        return when {
+            drawerExpanded && drawerFullScroll != null -> {
+                when (val scrollable = drawerFullScroll) {
+                    is android.widget.ScrollView -> if (deltaY != 0) scrollable.scrollBy(0, deltaY)
+                    is android.widget.GridView -> if (deltaY != 0) scrollable.scrollListBy(deltaY)
+                    is android.widget.ListView -> if (deltaY != 0) scrollable.scrollListBy(deltaY)
+                    else -> return false
+                }
+                true
+            }
+            !drawerExpanded && drawerRecentScroll != null && deltaX != 0 -> {
+                // Touch-style scrolling: finger right -> content left.
+                drawerRecentScroll?.scrollBy(deltaX, 0)
+                true
+            }
+            else -> false
         }
     }
 
@@ -694,9 +755,12 @@ class DesktopShellActivity : ComponentActivity() {
         }
         val scroll = android.widget.HorizontalScrollView(displayContext).apply {
             isHorizontalScrollBarEnabled = false
+            isSmoothScrollingEnabled = true
             overScrollMode = View.OVER_SCROLL_NEVER
+            descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
             addView(recentRow, ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, rowHeight - dp(12)))
         }
+        drawerRecentScroll = scroll
         container.addView(scroll, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, rowHeight - dp(12), Gravity.TOP
         ))
@@ -843,6 +907,11 @@ class DesktopShellActivity : ComponentActivity() {
         }
         val recentSet = cachedRecentPackages.toSet()
         val ordered = apps.sortedWith(compareByDescending<com.ynk.virtualdisplay.protocol.DeviceMessage.AppEntry> { it.packageName in recentSet }.thenBy { it.name.lowercase() })
+        // Cache the actual item views by package. The old adapter ignored
+        // convertView and recreated the complete icon/text hierarchy (including
+        // drawable setup and gesture listeners) every time GridView/ListView
+        // requested a row, which caused visible GC/layout spikes while scrolling.
+        val viewCache = HashMap<String, View>(ordered.size)
         val adapter = object : BaseAdapter() {
             override fun getCount() = ordered.size
             override fun getItem(position: Int) = ordered[position]
@@ -850,10 +919,17 @@ class DesktopShellActivity : ComponentActivity() {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val app = ordered[position]
                 val recent = app.packageName in recentSet
-                return createAppItem(app.packageName, if (recent) "★  ${app.name}" else app.name, compact = false) {
+                val label = if (recent) "★  ${app.name}" else app.name
+                val cached = viewCache[app.packageName]
+                if (cached != null && cached.parent == null) {
+                    return cached
+                }
+                val created = createAppItem(app.packageName, label, compact = false) {
                     closeAppDrawer()
                     launchRemoteAppMaximized(app.packageName)
                 }
+                viewCache[app.packageName] = created
+                return created
             }
         }
         val list: View = if (showAppIcons()) {
@@ -876,6 +952,7 @@ class DesktopShellActivity : ComponentActivity() {
                 clipToPadding = false
             }
         }
+        drawerFullScroll = list
         container.addView(list, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, drawerHeight - dp(92), Gravity.TOP
         ).apply { topMargin = dp(86) })
@@ -887,6 +964,8 @@ class DesktopShellActivity : ComponentActivity() {
         drawerOverlayWindowManager = null
         drawerOverlayRoot = null
         drawerOverlayParams = null
+        drawerRecentScroll = null
+        drawerFullScroll = null
         drawerExpanded = false
         drawerPointerLatched = false
         drawerRightButtonLatched = false
@@ -1052,6 +1131,7 @@ class DesktopShellActivity : ComponentActivity() {
      * its normal pointer behavior.
      */
     private fun showDesktopSettingsMenu(anchor: View) {
+        ++contextMenuRequestSerial
         contextMenuPopup?.dismiss()
         lifecycleScope.launch {
             lateinit var popup: PopupWindow
@@ -1097,6 +1177,10 @@ class DesktopShellActivity : ComponentActivity() {
             addContextAction(popupContent, "分辨率 / DPI", android.R.drawable.ic_menu_crop, action = {
                 popup.dismiss()
                 showDisplaySettingsDialog()
+            })
+            addContextAction(popupContent, "光标灵敏度", android.R.drawable.ic_menu_mylocation, action = {
+                popup.dismiss()
+                showCursorSensitivityMenu()
             })
             addContextAction(popupContent, "刷新应用与任务栏", android.R.drawable.ic_popup_sync, action = {
                 popup.dismiss()
@@ -1175,6 +1259,166 @@ class DesktopShellActivity : ComponentActivity() {
                 Log.e("DesktopSettingsMenu", "SHOW_FAILED", it)
             }
         }
+    }
+
+    private fun showCursorSensitivityMenu() {
+        contextMenuRequestSerial++
+        contextMenuPopup?.dismiss()
+        val cursorPercent = desktopPrefs.getInt("desktop_cursor_sensitivity_percent", 0).coerceIn(-100, 100)
+        val scrollPercent = desktopPrefs.getInt("desktop_scroll_sensitivity_percent", 0).coerceIn(-100, 100)
+        lifecycleScope.launch {
+            lateinit var popup: PopupWindow
+            val content = LinearLayout(this@DesktopShellActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                background = rounded(0xF0161A20.toInt(), 18f)
+                minimumWidth = dp(380)
+            }
+            val header = LinearLayout(this@DesktopShellActivity).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(4), dp(8), dp(8))
+            }
+            header.addView(ImageView(this@DesktopShellActivity).apply {
+                setImageResource(android.R.drawable.ic_menu_mylocation)
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+            }, LinearLayout.LayoutParams(dp(38), dp(38)))
+            header.addView(TextView(this@DesktopShellActivity).apply {
+                text = "光标灵敏度"
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), 0, 0, 0)
+            }, LinearLayout.LayoutParams(0, dp(38), 1f))
+            content.addView(header)
+
+            fun addSensitivitySlider(title: String, initialPercent: Int, onChanged: (Int) -> Unit) {
+                val row = LinearLayout(this@DesktopShellActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(10), dp(6), dp(10), dp(8))
+                }
+                val captionRow = LinearLayout(this@DesktopShellActivity).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val label = TextView(this@DesktopShellActivity).apply {
+                    text = title
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                }
+                val value = TextView(this@DesktopShellActivity).apply {
+                    text = sensitivityPercentText(initialPercent)
+                    setTextColor(0xFFCBD2DC.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                    gravity = Gravity.CENTER_VERTICAL or Gravity.END
+                }
+                captionRow.addView(label, LinearLayout.LayoutParams(0, dp(32), 1f))
+                captionRow.addView(value, LinearLayout.LayoutParams(dp(80), dp(32)))
+                row.addView(captionRow)
+                val seek = SeekBar(this@DesktopShellActivity).apply {
+                    max = 200
+                    progress = initialPercent + 100
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                            val percent = (progress - 100).coerceIn(-100, 100)
+                            value.text = sensitivityPercentText(percent)
+                            if (fromUser) onChanged(percent)
+                        }
+                        override fun onStartTrackingTouch(bar: SeekBar?) = Unit
+                        override fun onStopTrackingTouch(bar: SeekBar?) = Unit
+                    })
+                }
+                row.addView(seek, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
+                content.addView(row)
+            }
+
+            addSensitivitySlider("光标速度", cursorPercent) { percent ->
+                desktopPrefs.edit().putInt("desktop_cursor_sensitivity_percent", percent).apply()
+                com.ynk.virtualdisplay.ui.display.InputController.setDesktopCursorSensitivityPercent(percent)
+            }
+            addSensitivitySlider("双指滚动速度", scrollPercent) { percent ->
+                desktopPrefs.edit().putInt("desktop_scroll_sensitivity_percent", percent).apply()
+                com.ynk.virtualdisplay.ui.display.InputController.setDesktopScrollSensitivityPercent(percent)
+            }
+
+            addContextSeparator(content)
+            val hint = TextView(this@DesktopShellActivity).apply {
+                text = "-100% ～ +100%：相对默认速度的调节幅度"
+                setTextColor(0xFF9FA9B7.toInt())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(dp(10), dp(2), dp(10), dp(8))
+            }
+            content.addView(hint)
+            val back = TextView(this@DesktopShellActivity).apply {
+                text = "‹  返回桌面设置"
+                setTextColor(0xFFCBD2DC.toInt())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), 0, dp(10), 0)
+                isClickable = true
+                setOnClickListener {
+                    popup.dismiss()
+                    showDesktopSettingsMenu(desktopTaskbar ?: content)
+                }
+            }
+            content.addView(back, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
+
+            popup = PopupWindow(
+                content,
+                minOf(dp(400), targetDisplayWidthForPopup() - dp(24)),
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                true
+            ).apply {
+                elevation = dp(32).toFloat()
+                isOutsideTouchable = true
+                inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    setWindowLayoutType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+                }
+                setClippingEnabled(false)
+            }
+            content.measure(
+                View.MeasureSpec.makeMeasureSpec(minOf(dp(400), targetDisplayWidthForPopup() - dp(24)), View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(dp(500), View.MeasureSpec.AT_MOST)
+            )
+            val anchor = desktopTaskbar ?: desktopRoot ?: content
+            val loc = IntArray(2)
+            anchor.getLocationOnScreen(loc)
+            val popupWidth = content.measuredWidth.coerceAtLeast(1)
+            val popupHeight = content.measuredHeight.coerceAtLeast(1)
+            val screenWidth = desktopWindowLayer?.width?.takeIf { it > 0 } ?: targetDisplayWidthForPopup()
+            val margin = dp(12)
+            val left = (loc[0] + anchor.width - popupWidth).coerceIn(
+                margin, (screenWidth - popupWidth - margin).coerceAtLeast(margin)
+            )
+            val top = (loc[1] - popupHeight - dp(8)).coerceAtLeast(margin)
+            popup.setOnDismissListener {
+                if (contextMenuPopup === popup) {
+                    contextMenuPopup = null
+                    contextMenuRoot = null
+                    contextMenuPointerLatched = false
+                    contextMenuRightButtonLatched = false
+                    contextMenuLeft = 0
+                    contextMenuTop = 0
+                    contextMenuWidth = 0
+                    contextMenuHeight = 0
+                }
+            }
+            runCatching {
+                popup.showAtLocation(anchor, Gravity.TOP or Gravity.START, left, top)
+                contextMenuPopup = popup
+                contextMenuRoot = content
+                contextMenuLeft = left
+                contextMenuTop = top
+                contextMenuWidth = popupWidth
+                contextMenuHeight = popupHeight
+                contextMenuPointerLatched = false
+                contextMenuRightButtonLatched = false
+            }.onFailure { Log.e("DesktopSettingsMenu", "SENSITIVITY_SHOW_FAILED", it) }
+        }
+    }
+
+    private fun sensitivityPercentText(percent: Int): String = when {
+        percent > 0 -> "+${percent}%"
+        else -> "${percent}%"
     }
 
     private fun showWallpaperMenu() {
@@ -1579,7 +1823,7 @@ class DesktopShellActivity : ComponentActivity() {
         }
     }
 
-    private fun showAppIcons(): Boolean = desktopPrefs.getBoolean("show_app_icons", false)
+    private fun showAppIcons(): Boolean = desktopPrefs.getBoolean("show_app_icons", true)
 
     private fun createAppItem(packageName: String, label: String, compact: Boolean, onClick: () -> Unit): View {
         return if (!showAppIcons()) {
@@ -1653,8 +1897,13 @@ class DesktopShellActivity : ComponentActivity() {
     }
 
     private fun showAppShortcutMenu(anchor: View, pkg: String) {
+        val requestSerial = ++contextMenuRequestSerial
+        contextMenuPopup?.dismiss()
+        contextMenuPointerLatched = false
+        contextMenuRightButtonLatched = false
         lifecycleScope.launch {
             val shortcuts = withContext(Dispatchers.IO) { queryPublishedShortcuts(pkg) }
+            if (requestSerial != contextMenuRequestSerial || isFinishing || isDestroyed) return@launch
             lateinit var popup: PopupWindow
             val popupContent = LinearLayout(this@DesktopShellActivity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -2048,10 +2297,17 @@ class DesktopShellActivity : ComponentActivity() {
 
     private fun closeAppTask(packageName: String) {
         lifecycleScope.launch(Dispatchers.IO) {
-            runCatching {
-                runShizuku("am force-stop $packageName")
-            }.onFailure {
+            val stopped = runCatching {
+                VirtualDisplayTaskManager.forceStopPackage(packageName)
+            }.getOrElse {
                 Log.e("DesktopShell", "关闭应用失败", it)
+                false
+            }
+            withContext(Dispatchers.Main.immediate) {
+                // Reuse the exact same close path as the title-bar close button.
+                // This keeps display/session teardown identical for manual and
+                // app-context-menu initiated window closing.
+                desktopWindows.filter { it.packageName == packageName }.toList().forEach { it.closeWindow() }
             }
         }
     }

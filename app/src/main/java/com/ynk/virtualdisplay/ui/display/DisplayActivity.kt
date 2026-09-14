@@ -160,6 +160,7 @@ class DisplayActivity : ComponentActivity() {
             repository = repository,
             displayIdProvider = { remoteDisplayId },
             scope = lifecycleScope,
+            context = this,
         )
         inputController.setDesktopModeEnabled(desktopMode)
         inputController.setTrackpadModeEnabled(trackpadEnabled)
