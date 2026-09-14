@@ -39,6 +39,8 @@ import com.ynk.virtualdisplay.manager.DisplayMetricsManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 import org.koin.android.ext.android.inject
 import com.ynk.virtualdisplay.webrtc.GatewayProcessController
 import com.ynk.virtualdisplay.ui.desktop.VirtualDisplayTaskManager
@@ -49,6 +51,24 @@ class DisplayActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "DisplayActivity"
+        private val instances = ConcurrentHashMap<Int, WeakReference<DisplayActivity>>()
+
+        /**
+         * Used by the desktop settings DLNA action. It changes only the local
+         * preview state; the shared gateway remains running and the scrcpy
+         * transport is untouched.
+         */
+        fun setLocalPreviewSuppressedForDisplay(displayId: Int, suppressed: Boolean): Boolean {
+            val activity = instances[displayId]?.get() ?: return false
+            activity.runOnUiThread {
+                if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
+                activity.lifecycleScope.launch {
+                    activity.setLocalDecodeSuppressedSync(suppressed)
+                    activity.applyLocalPreviewUi(suppressed)
+                }
+            }
+            return true
+        }
 
         fun createIntent(
             context: Context,
@@ -146,6 +166,7 @@ class DisplayActivity : ComponentActivity() {
         require(displayId != -1) { "Invalid display_id" }
         remoteDisplayId = displayId
         nodeKey = intent.getStringExtra("node_key")
+        instances[displayId] = WeakReference(this)
         desktopMode = intent.getBooleanExtra("desktop_mode", false)
         // Desktop mode is inherently a trackpad/mouse-only surface. Normal mode
         // keeps the legacy touchscreen behavior unless the user explicitly enables
@@ -230,6 +251,10 @@ class DisplayActivity : ComponentActivity() {
         if (isLocalNode) {
             val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
             dm.unregisterDisplayListener(displayListener)
+        }
+        remoteDisplayId?.let { id ->
+            val current = instances[id]?.get()
+            if (current === this) instances.remove(id)
         }
     }
 

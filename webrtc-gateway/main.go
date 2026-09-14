@@ -3,15 +3,19 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,10 +28,8 @@ import (
 )
 
 const (
-	// Built-in scrcpy daemon socket roles.
+	// Built-in scrcpy daemon roles used by this video-only gateway.
 	roleVideo       = 0
-	roleAudio       = 1
-	roleControl     = 2
 	roleNegotiation = 3
 
 	// Current daemon protocol message.
@@ -49,9 +51,23 @@ const (
 	flagKeyFrame = 1 << 1
 
 	defaultH264ProfileLevelID = "42e032"
-	frameHistoryWindow        = 4 * time.Second
-	frameHistoryMaxFrames     = 600
+	frameHistoryWindow        = 10 * time.Second
+	frameHistoryMaxFrames     = 1200
 	maxFramePayload           = 32 * 1024 * 1024
+
+	// DLNA/UPnP defaults. DLNA consumes a live MPEG-TS resource over HTTP;
+	// the gateway does not decode or re-encode the scrcpy H.264 stream.
+	dlnaDefaultListenHost = ""
+	dlnaStreamPath        = "/dlna/stream.ts"
+	dlnaControlTimeout    = 4 * time.Second
+	dlnaHTTPTimeout       = 8 * time.Second
+	dlnaPlaybackDelay     = 3 * time.Second
+	dlnaFlushInterval     = 100 * time.Millisecond
+	dlnaHTTPWriteBuffer   = 256 * 1024
+
+	tsPIDVideo uint16 = 0x0100
+	tsPIDPMT   uint16 = 0x1000
+	tsPCRBase  uint64 = 90000
 )
 
 const browserHTML = `<!doctype html>
@@ -74,7 +90,7 @@ button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;paddin
 </style>
 </head>
 <body>
-<div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><button id="reconnect">Reconnect</button></div>
+<div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><button id="reconnect">Reconnect</button><a href="/dlna" style="color:#9ad;text-decoration:none">DLNA投屏</a></div>
 <div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"></div></div>
 <script>
 const video=document.getElementById('video');
@@ -170,23 +186,42 @@ async function pollCursor(){
   requestAnimationFrame(()=>setTimeout(pollCursor,33));
 }
 
-async function start(){
-  if(pc){try{pc.close()}catch(e){}pc=null;}
-  setStatus('creating peer...');
-  pc=new RTCPeerConnection({iceServers:[]});
-  pc.addTransceiver('video',{direction:'recvonly'});
-  pc.ontrack=e=>{
-    video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);
-    video.play().catch(()=>{});
-    applyVideoLayout();
-  };
-  video.onloadedmetadata=()=>{
-    sourceW=video.videoWidth; sourceH=video.videoHeight;
-    applyVideoLayout();
-  };
-  pc.oniceconnectionstatechange=()=>setStatus('ICE: '+pc.iceConnectionState);
-  pc.onconnectionstatechange=()=>setStatus('PC: '+pc.connectionState);
-  try{
+window.addEventListener('resize',applyVideoLayout);
+document.getElementById('reconnect').onclick=()=>start(true);
+let autoRetryTimer=null;
+let starting=false;
+function scheduleAutoReconnect(delay=1200){
+  if(autoRetryTimer) return;
+  autoRetryTimer=setTimeout(()=>{ autoRetryTimer=null; start(true).catch(()=>{}); },delay);
+}
+async function start(auto=false){
+  if(starting) return;
+  starting=true;
+  try {
+    if(pc){try{pc.close()}catch(e){}pc=null;}
+    setStatus('creating peer...');
+    pc=new RTCPeerConnection({iceServers:[]});
+    pc.addTransceiver('video',{direction:'recvonly'});
+    pc.ontrack=e=>{
+      video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);
+      video.play().catch(()=>{});
+      applyVideoLayout();
+    };
+    video.onloadedmetadata=()=>{
+      sourceW=video.videoWidth; sourceH=video.videoHeight;
+      applyVideoLayout();
+    };
+    pc.oniceconnectionstatechange=()=>{
+      const st=pc?pc.iceConnectionState:'closed';
+      setStatus('ICE: '+st);
+      if((st==='failed'||st==='disconnected')&&auto) scheduleAutoReconnect(1000);
+    };
+    pc.onconnectionstatechange=()=>{
+      const st=pc?pc.connectionState:'closed';
+      setStatus('PC: '+st);
+      if((st==='failed'||st==='disconnected'||st==='closed')&&auto) scheduleAutoReconnect(1200);
+      else if(st==='connected') setTimeout(applyVideoLayout,50);
+    };
     await refreshStatus();
     const offer=await pc.createOffer({offerToReceiveVideo:true});
     await pc.setLocalDescription(offer);
@@ -203,14 +238,108 @@ async function start(){
     await refreshStatus();
     setStatus('connected');
     setTimeout(applyVideoLayout,100);
-  }catch(e){
-    console.error('[WebRTC]',e);setStatus('error: '+e.message);
+  } catch(e) {
+    console.error('[WebRTC]',e);
+    setStatus('error: '+e.message);
     if(pc){try{pc.close()}catch(_){}pc=null;}
+    if(auto) scheduleAutoReconnect(1200);
+    throw e;
+  } finally {
+    starting=false;
   }
 }
-window.addEventListener('resize',applyVideoLayout);
-document.getElementById('reconnect').onclick=start;
-start(); pollCursor(); setInterval(refreshStatus,1000);
+start(true).catch(()=>{});
+pollCursor(); setInterval(refreshStatus,1000);
+</script>
+</body>
+</html>`
+
+const dlnaHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VirtualDisplay DLNA</title>
+<style>
+html,body{margin:0;padding:0;background:#111;color:#ddd;font-family:system-ui,sans-serif;min-height:100%}
+body{display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
+.card{width:min(560px,100%);background:#202020;border:1px solid #444;border-radius:10px;padding:24px;box-sizing:border-box;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+h1{margin:0 0 18px;font-size:22px}
+.row{display:flex;gap:10px;align-items:center;margin:12px 0}
+label{font-size:14px;color:#aaa;min-width:90px}
+input{flex:1;box-sizing:border-box;background:#111;color:#eee;border:1px solid #555;border-radius:6px;padding:10px 12px;font-size:15px}
+button{background:#333;color:#eee;border:1px solid #666;border-radius:6px;padding:9px 14px;cursor:pointer}
+button:hover{background:#444}
+button:disabled{opacity:.5;cursor:default}
+#status{margin-top:16px;min-height:24px;color:#9ad;white-space:pre-wrap;word-break:break-word}
+.hint{font-size:12px;color:#888;line-height:1.5;margin-top:14px}
+a{color:#9ad}
+#devices{margin-top:18px}.device{padding:12px;border:1px solid #444;border-radius:8px;margin:8px 0;background:#181818;cursor:pointer}.device:hover{background:#272727}.device .name{font-size:15px;color:#eee}.device .meta{font-size:12px;color:#888;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>DLNA 投屏</h1>
+<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><button id="scan">搜索设备</button></div>
+<div id="devices"><div class="hint">正在搜索局域网 DLNA Renderer...</div></div>
+<div class="row">
+<button id="dlnaStart">按 IP 投屏</button>
+<button id="dlnaStop">停止投屏</button>
+<a href="/">返回 WebRTC</a>
+</div>
+<div id="status">准备就绪</div>
+<div class="hint">下方会列出自动发现的 DLNA Renderer，点击设备即可投屏。也可以手动输入 Renderer IP；自动发现失败时不影响按 IP 投屏。</div>
+</div>
+<script>
+const ip=document.getElementById('dlnaIp');
+const status=document.getElementById('status');
+const start=document.getElementById('dlnaStart');
+const stop=document.getElementById('dlnaStop');
+const scan=document.getElementById('scan');
+const devices=document.getElementById('devices');
+function setStatus(s){status.textContent=s;}
+async function loadStatus(){
+  try{const r=await fetch('/dlna/status',{cache:'no-store'}); if(!r.ok)return; const x=await r.json(); if(x.target)ip.value=x.target; if(x.active)setStatus('投屏中\n'+x.target+'\n'+x.url); else if(x.error)setStatus('失败：'+x.error);}
+  catch(e){}
+}
+async function cast(v){
+  v=(v||'').trim(); if(!v){setStatus('请输入电视 IP');return;}
+  ip.value=v; setStatus('正在连接 '+v+' ...'); start.disabled=true;
+  try{
+    const r=await fetch('/dlna/cast',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:v})});
+    const t=await r.text(); if(!r.ok)throw new Error(t);
+    let x={}; try{x=JSON.parse(t)}catch(e){}
+    setStatus('投屏已启动\n'+(x.url||''));
+  }catch(e){setStatus('失败：'+e.message)} finally{start.disabled=false;}
+}
+start.onclick=()=>cast(ip.value);
+stop.onclick=async()=>{
+  stop.disabled=true;
+  try{const r=await fetch('/dlna/stop',{method:'POST'}); const t=await r.text(); if(!r.ok)throw new Error(t); setStatus('已停止投屏');}
+  catch(e){setStatus('失败：'+e.message)} finally{stop.disabled=false;}
+};
+async function scanDevices(){
+  scan.disabled=true; devices.innerHTML='<div class="hint">正在搜索局域网 DLNA Renderer...</div>';
+  try{
+    const r=await fetch('/dlna/devices',{cache:'no-store'}); if(!r.ok)throw new Error(await r.text());
+    const x=await r.json(); const list=x.devices||[];
+    if(!list.length){devices.innerHTML='<div class="hint">没有自动发现 DLNA Renderer，可以直接输入 IP。</div>';return;}
+    devices.innerHTML='';
+    for(const d of list){
+      const el=document.createElement('div'); el.className='device';
+      el.innerHTML='<div class="name"></div><div class="meta"></div>';
+      el.querySelector('.name').textContent=d.name||'DLNA Renderer';
+      el.querySelector('.meta').textContent=(d.ip||'')+' · '+(d.serviceType||'AVTransport');
+      el.onclick=()=>cast(d.ip);
+      devices.appendChild(el);
+    }
+  }catch(e){devices.innerHTML='<div class="hint">搜索失败：'+e.message+'</div>'}
+  finally{scan.disabled=false;}
+}
+scan.onclick=scanDevices;
+loadStatus();
+scanDevices();
+setInterval(loadStatus,2000);
 </script>
 </body>
 </html>`
@@ -277,6 +406,11 @@ type h264Source struct {
 	frameOverruns    uint64
 	recoveryCount    uint64
 	cursor           cursorState
+
+	dlnaMu       sync.Mutex
+	dlnaCancel   context.CancelFunc
+	dlnaTargetIP string
+	dlnaURL      string
 }
 
 func main() {
@@ -340,6 +474,19 @@ func main() {
 	mux.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) { handleOffer(source, w, r) })
 	mux.HandleFunc("/cursor", func(w http.ResponseWriter, r *http.Request) { handleCursor(source, w, r) })
 	mux.HandleFunc("/debug/status", func(w http.ResponseWriter, r *http.Request) { handleDebugStatus(source, w, r) })
+	mux.HandleFunc("/dlna", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/dlna" && r.URL.Path != "/dlna/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, dlnaHTML)
+	})
+	mux.HandleFunc("/dlna/cast", func(w http.ResponseWriter, r *http.Request) { handleDLNACast(source, w, r) })
+	mux.HandleFunc("/dlna/stop", func(w http.ResponseWriter, r *http.Request) { handleDLNAStop(source, w, r) })
+	mux.HandleFunc("/dlna/status", func(w http.ResponseWriter, r *http.Request) { handleDLNAStatus(source, w, r) })
+	mux.HandleFunc("/dlna/devices", handleDLNADevices)
+	mux.HandleFunc(dlnaStreamPath, func(w http.ResponseWriter, r *http.Request) { source.serveDLNAStream(w, r) })
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "ok\n")
@@ -1031,6 +1178,1084 @@ func (s *h264Source) pollCursorURL(url string) {
 		s.mu.Lock()
 		s.cursor = c
 		s.mu.Unlock()
+	}
+}
+
+// ---- DLNA output (H.264 -> MPEG-TS over HTTP + UPnP AVTransport) ----
+
+type dlnaCastRequest struct {
+	IP string `json:"ip"`
+}
+
+type dlnaStatus struct {
+	Active bool   `json:"active"`
+	Target string `json:"target,omitempty"`
+	URL    string `json:"url,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type upnpService struct {
+	ServiceType string `xml:"serviceType"`
+	ControlURL  string `xml:"controlURL"`
+}
+
+type upnpDeviceDescription struct {
+	Device struct {
+		ServiceList struct {
+			Services []upnpService `xml:"service"`
+		} `xml:"serviceList"`
+		Devices []struct {
+			ServiceList struct {
+				Services []upnpService `xml:"service"`
+			} `xml:"serviceList"`
+		} `xml:"deviceList>device"`
+	} `xml:"device"`
+}
+
+func handleDLNACast(src *h264Source, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req dlnaCastRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	ip := strings.TrimSpace(req.IP)
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil || parsedIP.To4() == nil {
+		http.Error(w, "invalid TV IPv4 address", http.StatusBadRequest)
+		return
+	}
+	if parsedIP.IsLoopback() || parsedIP.IsUnspecified() {
+		http.Error(w, "TV IP cannot be 127.0.0.1/localhost; enter the TV LAN IP", http.StatusBadRequest)
+		return
+	}
+	ip = parsedIP.To4().String()
+	if err := src.startDLNACast(ip); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "target": ip, "url": src.dlnaURLValue()})
+}
+
+func handleDLNAStop(src *h264Source, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	src.stopDLNACast()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
+func handleDLNAStatus(src *h264Source, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	st := src.dlnaStatusValue()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(st)
+}
+
+func handleDLNADevices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+	devices := discoverDLNADevices(ctx)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"devices": devices})
+}
+
+type dlnaDevice struct {
+	IP          string `json:"ip"`
+	Name        string `json:"name"`
+	Location    string `json:"location"`
+	ServiceType string `json:"serviceType,omitempty"`
+}
+
+func discoverDLNADevices(ctx context.Context) []dlnaDevice {
+	seen := map[string]dlnaDevice{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, localIP := range localIPv4s() {
+		localIP := localIP
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, st := range []string{
+				"urn:schemas-upnp-org:device:MediaRenderer:1",
+				"urn:schemas-upnp-org:service:AVTransport:1",
+				"ssdp:all",
+			} {
+				for _, loc := range ssdpSearchAllFromLocal(ctx, localIP, st) {
+					d, ok := inspectDLNACandidate(loc)
+					if !ok || d.IP == "" || d.ServiceType == "" {
+						continue
+					}
+					mu.Lock()
+					seen[d.IP+"|"+d.Location] = d
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	out := make([]dlnaDevice, 0, len(seen))
+	for _, d := range seen {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ni, nj := strings.ToLower(out[i].Name), strings.ToLower(out[j].Name)
+		if ni == nj {
+			return out[i].IP < out[j].IP
+		}
+		return ni < nj
+	})
+	return out
+}
+
+func localIPv4s() []string {
+	var out []string
+	seen := map[string]bool{}
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			ip = ip.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+				continue
+			}
+			v := ip.String()
+			if !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+func ssdpSearchAllFromLocal(ctx context.Context, localIP, st string) []string {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(localIP).To4(), Port: 0})
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	msg := "M-SEARCH * HTTP/1.1\r\n" +
+		"HOST: 239.255.255.250:1900\r\n" +
+		"MAN: \"ssdp:discover\"\r\n" +
+		"MX: 1\r\n" +
+		"ST: " + st + "\r\n\r\n"
+	if _, err := conn.WriteToUDP([]byte(msg), &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}); err != nil {
+		return nil
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetReadDeadline(deadline)
+	var out []string
+	buf := make([]byte, 8192)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			break
+		}
+		if loc := strings.TrimSpace(parseHTTPHeaders(buf[:n])["location"]); loc != "" {
+			out = append(out, loc)
+		}
+	}
+	return out
+}
+
+func inspectDLNACandidate(location string) (dlnaDevice, bool) {
+	u, err := url.Parse(strings.TrimSpace(location))
+	if err != nil || u.Hostname() == "" {
+		return dlnaDevice{}, false
+	}
+	client := &http.Client{Timeout: 900 * time.Millisecond, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 2 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}}
+	resp, err := client.Get(location)
+	if err != nil || resp == nil {
+		return dlnaDevice{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return dlnaDevice{}, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil {
+		return dlnaDevice{}, false
+	}
+	name, serviceType := parseDLNACandidateDescription(body)
+	if !strings.Contains(strings.ToLower(serviceType), "avtransport") {
+		if !bytes.Contains(bytes.ToLower(body), []byte("avtransport")) {
+			return dlnaDevice{}, false
+		}
+		serviceType = "AVTransport"
+	}
+	if name == "" {
+		name = u.Hostname()
+	}
+	return dlnaDevice{IP: u.Hostname(), Name: name, Location: location, ServiceType: serviceType}, true
+}
+
+func parseDLNACandidateDescription(body []byte) (string, string) {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	name := ""
+	serviceType := ""
+	inService := false
+	current := ""
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			current = strings.ToLower(t.Name.Local)
+			if current == "service" {
+				inService = true
+				serviceType = ""
+			}
+		case xml.CharData:
+			v := strings.TrimSpace(string(t))
+			if v == "" {
+				continue
+			}
+			if current == "friendlyname" && name == "" {
+				name = v
+			}
+			if inService && current == "servicetype" && strings.Contains(strings.ToLower(v), "avtransport") {
+				serviceType = v
+			}
+		case xml.EndElement:
+			if strings.EqualFold(t.Name.Local, "service") {
+				inService = false
+			}
+			current = ""
+		}
+	}
+	return name, serviceType
+}
+
+func (s *h264Source) dlnaStatusValue() dlnaStatus {
+	s.dlnaMu.Lock()
+	defer s.dlnaMu.Unlock()
+	return dlnaStatus{Active: s.dlnaCancel != nil, Target: s.dlnaTargetIP, URL: s.dlnaURL}
+}
+
+func (s *h264Source) dlnaURLValue() string {
+	s.dlnaMu.Lock()
+	defer s.dlnaMu.Unlock()
+	return s.dlnaURL
+}
+
+func (s *h264Source) startDLNACast(targetIP string) error {
+	s.stopDLNACast()
+
+	location, err := discoverDLNADevice(targetIP)
+	if err != nil {
+		return err
+	}
+	controlURL, err := fetchAVTransportControlURL(location)
+	if err != nil {
+		return err
+	}
+
+	gatewayIP := strings.TrimSpace(os.Getenv("DLNA_PUBLIC_IP"))
+	if parsed := net.ParseIP(gatewayIP); parsed != nil && parsed.To4() != nil && !parsed.IsLoopback() && !parsed.IsUnspecified() {
+		gatewayIP = parsed.To4().String()
+	} else {
+		gatewayIP = localIPFor(targetIP)
+	}
+	if gatewayIP == "" {
+		return fmt.Errorf("cannot determine gateway LAN IP for TV %s; set DLNA_PUBLIC_IP to the gateway LAN IPv4 address", targetIP)
+	}
+	log.Printf("DLNA gateway media address selected: %s (target=%s)", gatewayIP, targetIP)
+	listenHost := os.Getenv("DLNA_LISTEN_HOST")
+	if listenHost == "" {
+		listenHost = "0.0.0.0"
+	}
+	port := getenvInt("DLNA_PORT", 19001)
+	mediaURL := "http://" + gatewayIP + ":" + strconv.Itoa(port) + dlnaStreamPath
+	if err := s.ensureDLNAServer(listenHost, port); err != nil {
+		return err
+	}
+
+	metadata := buildDLNAMetadata(mediaURL, s.headerSnapshot())
+	if err := upnpSOAP(controlURL, "SetAVTransportURI", map[string]string{
+		"InstanceID":         "0",
+		"CurrentURI":         mediaURL,
+		"CurrentURIMetaData": metadata,
+	}); err != nil {
+		return fmt.Errorf("DLNA SetAVTransportURI: %w", err)
+	}
+	if err := upnpSOAP(controlURL, "Play", map[string]string{
+		"InstanceID": "0",
+		"Speed":      "1",
+	}); err != nil {
+		return fmt.Errorf("DLNA Play: %w", err)
+	}
+
+	s.dlnaMu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.dlnaCancel = cancel
+	s.dlnaTargetIP = targetIP
+	s.dlnaURL = mediaURL
+	s.dlnaMu.Unlock()
+	_ = ctx
+	log.Printf("DLNA cast started: target=%s location=%s media=%s", targetIP, location, mediaURL)
+	return nil
+}
+
+func (s *h264Source) stopDLNACast() {
+	s.dlnaMu.Lock()
+	cancel := s.dlnaCancel
+	s.dlnaCancel = nil
+	s.dlnaTargetIP = ""
+	s.dlnaURL = ""
+	s.dlnaMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+var dlnaServerOnceMu sync.Mutex
+var dlnaServerPort int
+var dlnaServerHost string
+
+func (s *h264Source) ensureDLNAServer(host string, port int) error {
+	dlnaServerOnceMu.Lock()
+	defer dlnaServerOnceMu.Unlock()
+	if dlnaServerPort == port && dlnaServerHost == host {
+		return nil
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc(dlnaStreamPath, func(w http.ResponseWriter, r *http.Request) { s.serveDLNAStream(w, r) })
+	mux.HandleFunc("/dlna/description.xml", func(w http.ResponseWriter, r *http.Request) { serveDLNADeviceDescription(w, r) })
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return fmt.Errorf("DLNA HTTP listen %s:%d: %w", host, port, err)
+	}
+	dlnaServerPort, dlnaServerHost = port, host
+	go func() {
+		if err := http.Serve(ln, mux); err != nil && !strings.Contains(err.Error(), "closed network connection") {
+			log.Printf("DLNA HTTP server stopped: %v", err)
+		}
+	}()
+	return nil
+}
+
+func (s *h264Source) headerSnapshot() streamHeader {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.header
+}
+
+func discoverDLNADevice(targetIP string) (string, error) {
+	target := net.ParseIP(strings.TrimSpace(targetIP))
+	if target == nil || target.To4() == nil {
+		return "", fmt.Errorf("invalid renderer IP %q", targetIP)
+	}
+	targetIP = target.To4().String()
+	if target.IsLoopback() || target.IsUnspecified() {
+		return "", fmt.Errorf("invalid renderer IP %s: loopback/unspecified address is not a TV", targetIP)
+	}
+
+	// 1) Best effort: send M-SEARCH directly to the requested renderer.
+	// Some TVs do not reliably answer multicast discovery, but will answer a
+	// unicast M-SEARCH sent straight to their SSDP endpoint.
+	for _, st := range []string{
+		"urn:schemas-upnp-org:device:MediaRenderer:1",
+		"urn:schemas-upnp-org:service:AVTransport:1",
+		"ssdp:all",
+	} {
+		if loc := ssdpSearchTarget(targetIP, targetIP, st, 2*time.Second); loc != "" {
+			return loc, nil
+		}
+	}
+
+	// 2) Fall back to normal SSDP multicast, but only accept LOCATION URLs
+	// whose hostname matches the user-specified renderer IP.
+	if loc := ssdpSearchTarget(targetIP, "239.255.255.250", "urn:schemas-upnp-org:device:MediaRenderer:1", 2*time.Second); loc != "" {
+		return loc, nil
+	}
+	if loc := ssdpSearchTarget(targetIP, "239.255.255.250", "ssdp:all", 2*time.Second); loc != "" {
+		return loc, nil
+	}
+
+	// 3) Final fallback: many consumer TVs expose the UPnP root description
+	// without a discoverable SSDP response. Probe a small set of common HTTP
+	// ports/paths directly on the exact IP. The returned URL is then parsed for
+	// AVTransport exactly like a normal SSDP LOCATION.
+	for _, port := range []int{80, 8008, 8080, 8088, 8001, 8060, 9000, 9001, 49152, 49153, 5000, 52235, 7676, 3000, 7000} {
+		for _, path := range []string{"/description.xml", "/rootDesc.xml", "/dd.xml", "/DeviceDescription.xml", "/upnp/desc.xml", "/upnp/rootDesc.xml", "/xml/device_description.xml", "/etc/linuxigd/gatedesc.xml"} {
+			loc := fmt.Sprintf("http://%s:%d%s", targetIP, port, path)
+			if ok := probeUPnPDescription(loc); ok {
+				return loc, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("DLNA renderer %s not reachable via targeted SSDP, multicast SSDP, or direct UPnP description probe", targetIP)
+}
+
+func ssdpSearchTarget(targetIP, destination, st string, timeout time.Duration) string {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	msg := "M-SEARCH * HTTP/1.1\r\n" +
+		"HOST: " + net.JoinHostPort(destination, "1900") + "\r\n" +
+		"MAN: \"ssdp:discover\"\r\n" +
+		"MX: 1\r\n" +
+		"ST: " + st + "\r\n\r\n"
+	if _, err := conn.WriteToUDP([]byte(msg), &net.UDPAddr{IP: net.ParseIP(destination).To4(), Port: 1900}); err != nil {
+		return ""
+	}
+	buf := make([]byte, 8192)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return ""
+		}
+		headers := parseHTTPHeaders(buf[:n])
+		loc := strings.TrimSpace(headers["location"])
+		if loc == "" {
+			continue
+		}
+		u, err := url.Parse(loc)
+		if err != nil || !strings.EqualFold(u.Hostname(), targetIP) {
+			continue
+		}
+		return loc
+	}
+}
+
+func probeUPnPDescription(location string) bool {
+	client := &http.Client{
+		Timeout: 1200 * time.Millisecond,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 2 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+	resp, err := client.Get(location)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "avtransport") && strings.Contains(text, "upnp-org")
+}
+
+func fetchAVTransportControlURL(location string) (string, error) {
+	client := &http.Client{Timeout: dlnaHTTPTimeout}
+	resp, err := client.Get(location)
+	if err != nil {
+		return "", fmt.Errorf("fetch device description: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("device description HTTP %s", resp.Status)
+	}
+	var desc upnpDeviceDescription
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 512*1024)).Decode(&desc); err != nil {
+		return "", fmt.Errorf("parse device description: %w", err)
+	}
+	var raw string
+	for _, svc := range desc.Device.ServiceList.Services {
+		if strings.Contains(strings.ToLower(svc.ServiceType), "avtransport") {
+			raw = svc.ControlURL
+			break
+		}
+	}
+	if raw == "" {
+		for _, dev := range desc.Device.Devices {
+			for _, svc := range dev.ServiceList.Services {
+				if strings.Contains(strings.ToLower(svc.ServiceType), "avtransport") {
+					raw = svc.ControlURL
+					break
+				}
+			}
+		}
+	}
+	if raw == "" {
+		return "", fmt.Errorf("AVTransport service not found")
+	}
+	base, err := url.Parse(location)
+	if err != nil {
+		return "", err
+	}
+	u, err := base.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+func upnpSOAP(endpoint, action string, args map[string]string) error {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
+	b.WriteString(`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>`)
+	b.WriteString(`<u:` + action + ` xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">`)
+	for _, k := range []string{"InstanceID", "CurrentURI", "CurrentURIMetaData", "Speed"} {
+		if v, ok := args[k]; ok {
+			b.WriteString("<" + k + ">" + xmlEscape(v) + "</" + k + ">")
+		}
+	}
+	b.WriteString(`</u:` + action + `></s:Body></s:Envelope>`)
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(b.String()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", `text/xml; charset="utf-8"`)
+	req.Header.Set("SOAPACTION", `"urn:schemas-upnp-org:service:AVTransport:1#`+action+`"`)
+	resp, err := (&http.Client{Timeout: dlnaControlTimeout}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func buildDLNAMetadata(mediaURL string, h streamHeader) string {
+	name := "VirtualDisplay"
+	res := fmt.Sprintf(`<res protocolInfo="http-get:*:video/mpegts:*" size="0" resolution="%dx%d">%s</res>`, max(1, h.Width), max(1, h.Height), xmlEscape(mediaURL))
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="0" parentID="-1" restricted="1"><dc:title>%s</dc:title><upnp:class>object.item.videoItem</upnp:class>%s</item></DIDL-Lite>`, name, res)
+}
+
+func serveDLNADeviceDescription(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	_, _ = io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?><root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType><friendlyName>VirtualDisplay Gateway</friendlyName><manufacturer>VirtualDisplay</manufacturer><modelName>VirtualDisplay DLNA Server</modelName><UDN>uuid:virtualdisplay-gateway</UDN><serviceList><service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType><serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><controlURL>/dlna/control/content</controlURL><eventSubURL>/dlna/event/content</eventSubURL><SCPDURL>/dlna/scpd/content.xml</SCPDURL></service></serviceList></device></root>`)
+}
+
+func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	h := s.headerSnapshot()
+	if h.Width <= 0 || h.Height <= 0 {
+		h.Width, h.Height = 1920, 1080
+	}
+	w.Header().Set("Content-Type", "video/mpegts")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Connection", "keep-alive")
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	flusher, _ := w.(http.Flusher)
+	bw := bufio.NewWriterSize(w, dlnaHTTPWriteBuffer)
+	enc := newMPEGTSWriter(bw, uint16(h.Width), uint16(h.Height))
+	enc.writePATPMT()
+	if err := bw.Flush(); err != nil {
+		return
+	}
+	flusherSafeFlush(flusher)
+
+	// DLNA is intentionally delayed behind the live edge. The source keeps a
+	// larger frame history, so short renderer/Wi-Fi stalls consume this cushion
+	// instead of immediately hitting the live-source edge.
+	startSeq := s.dlnaBufferedStartSeq(dlnaPlaybackDelay)
+	if startSeq == 0 {
+		for {
+			s.mu.RLock()
+			key := s.latestKey
+			ch := s.changed
+			s.mu.RUnlock()
+			if key != nil {
+				startSeq = key.seq
+				break
+			}
+			t := time.NewTimer(2 * time.Second)
+			select {
+			case <-r.Context().Done():
+				t.Stop()
+				return
+			case <-ch:
+				if !t.Stop() {
+					select {
+					case <-t.C:
+					default:
+					}
+				}
+			case <-t.C:
+			}
+		}
+	}
+
+	var lastSeq uint64
+	var lastSourceAt time.Time
+	lastFlush := time.Now()
+	for {
+		frame, ok := s.nextFrameAfter(startSeq-1, 2*time.Second)
+		if !ok || frame == nil {
+			if r.Context().Err() != nil {
+				_ = bw.Flush()
+				return
+			}
+			if seq := s.dlnaBufferedStartSeq(dlnaPlaybackDelay); seq != 0 {
+				startSeq = seq
+				lastSeq = 0
+				continue
+			}
+			continue
+		}
+		startSeq = frame.seq + 1
+
+		// Keep real-time cadence while staying several seconds behind the live edge.
+		// The first cached keyframe starts immediately; following frames are paced by
+		// the original source arrival intervals so the initial cache is not burst-sent.
+		if !lastSourceAt.IsZero() {
+			delta := frame.receivedAt.Sub(lastSourceAt)
+			if delta < 0 {
+				delta = 0
+			}
+			if delta > 500*time.Millisecond {
+				delta = 500 * time.Millisecond
+			}
+			if delta > 0 {
+				t := time.NewTimer(delta)
+				select {
+				case <-r.Context().Done():
+					t.Stop()
+					_ = bw.Flush()
+					return
+				case <-t.C:
+				}
+			}
+		}
+		lastSourceAt = frame.receivedAt
+
+		data := frame.data
+		if frame.flags&flagKeyFrame != 0 && !containsSPSPPS(data) {
+			s.mu.RLock()
+			cfg := append([]byte(nil), s.config...)
+			s.mu.RUnlock()
+			if len(cfg) > 0 {
+				data = append(cfg, data...)
+			}
+		}
+		if lastSeq != 0 && frame.seq != lastSeq+1 && frame.flags&flagKeyFrame == 0 {
+			if seq := s.dlnaBufferedStartSeq(dlnaPlaybackDelay); seq != 0 {
+				startSeq = seq
+				lastSeq = 0
+				continue
+			}
+			continue
+		}
+		pts90k := uint64(max64(0, frame.ptsUs)) * 90 / 1000
+		if err := enc.writeH264AccessUnit(data, pts90k); err != nil {
+			_ = bw.Flush()
+			return
+		}
+		lastSeq = frame.seq
+		if time.Since(lastFlush) >= dlnaFlushInterval {
+			if err := bw.Flush(); err != nil {
+				return
+			}
+			flusherSafeFlush(flusher)
+			lastFlush = time.Now()
+		}
+	}
+}
+
+func (s *h264Source) dlnaBufferedStartSeq(delay time.Duration) uint64 {
+	cutoff := time.Now().Add(-delay)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := len(s.history) - 1; i >= 0; i-- {
+		f := s.history[i]
+		if f.receivedAt.After(cutoff) {
+			continue
+		}
+		if f.flags&flagKeyFrame != 0 {
+			return f.seq
+		}
+	}
+	return 0
+}
+
+func (s *h264Source) nextFrameAfter(after uint64, timeout time.Duration) (*h264Frame, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.RLock()
+		i := sort.Search(len(s.history), func(i int) bool { return s.history[i].seq > after })
+		if i < len(s.history) {
+			f := s.history[i]
+			s.mu.RUnlock()
+			return f, true
+		}
+		ch := s.changed
+		s.mu.RUnlock()
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return nil, false
+		}
+		t := time.NewTimer(minDuration(remain, 500*time.Millisecond))
+		select {
+		case <-ch:
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+		case <-t.C:
+			return nil, false
+		}
+	}
+}
+
+func (s *h264Source) nextFrame(after uint64, timeout time.Duration) (*h264Frame, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.RLock()
+		i := sort.Search(len(s.history), func(i int) bool { return s.history[i].seq > after })
+		if i < len(s.history) {
+			f := s.history[i]
+			if after != 0 || f.flags&flagKeyFrame != 0 {
+				s.mu.RUnlock()
+				return f, true
+			}
+		}
+		ch := s.changed
+		s.mu.RUnlock()
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return nil, false
+		}
+		t := time.NewTimer(minDuration(remain, 500*time.Millisecond))
+		select {
+		case <-ch:
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
+		case <-t.C:
+			return nil, false
+		}
+	}
+}
+
+type mpegTSWriter struct {
+	w  io.Writer
+	cc uint8
+}
+
+func newMPEGTSWriter(w io.Writer, _, _ uint16) *mpegTSWriter {
+	return &mpegTSWriter{w: w}
+}
+
+func (m *mpegTSWriter) writePATPMT() {
+	pat := buildPATPacket()
+	pmt := buildPMTPacket()
+	_, _ = m.w.Write(pat[:])
+	_, _ = m.w.Write(pmt[:])
+}
+
+func (m *mpegTSWriter) writeH264AccessUnit(annexBData []byte, pts90k uint64) error {
+	pes := buildPES(annexBData, pts90k)
+	return m.writePES(pes, true, pts90k)
+}
+
+func (m *mpegTSWriter) writePES(pes []byte, randomAccess bool, pts90k uint64) error {
+	first := true
+	for len(pes) > 0 {
+		var pkt [188]byte
+		pkt[0] = 0x47
+		pid := tsPIDVideo
+		pkt[1] = byte((pid >> 8) & 0x1f)
+		pkt[2] = byte(pid)
+
+		payloadCapacity := 184
+		adaptationLen := -1
+		if first {
+			// Put PCR on the PES start packet. This is important for live renderers
+			// which use the transport-stream clock rather than only PTS.
+			payloadCapacity = 176
+			if len(pes) < payloadCapacity {
+				payloadCapacity = len(pes)
+			}
+			adaptationLen = 183 - payloadCapacity
+			if adaptationLen < 7 {
+				payloadCapacity = 176
+				adaptationLen = 7
+			}
+		}
+		if !first && len(pes) < payloadCapacity {
+			adaptationLen = 183 - len(pes)
+			payloadCapacity = len(pes)
+		}
+
+		payloadStart := 4
+		if first {
+			pkt[1] |= 0x40
+		}
+		if adaptationLen >= 0 {
+			pkt[3] = 0x30 | (m.cc & 0x0f)
+			m.cc++
+			pkt[4] = byte(adaptationLen)
+			if adaptationLen > 0 {
+				flags := byte(0)
+				if first && randomAccess {
+					flags |= 0x40
+				}
+				if first {
+					flags |= 0x10 // PCR present
+				}
+				pkt[5] = flags
+				pos := 6
+				if first {
+					writePCR(pkt[pos:pos+6], pts90k)
+					pos += 6
+				}
+				for pos < 5+adaptationLen {
+					pkt[pos] = 0xff
+					pos++
+				}
+			}
+			payloadStart = 5 + adaptationLen
+		} else {
+			pkt[3] = 0x10 | (m.cc & 0x0f)
+			m.cc++
+		}
+		copy(pkt[payloadStart:], pes[:payloadCapacity])
+		for i := payloadStart + payloadCapacity; i < len(pkt); i++ {
+			pkt[i] = 0xff
+		}
+		if _, err := m.w.Write(pkt[:]); err != nil {
+			return err
+		}
+		pes = pes[payloadCapacity:]
+		first = false
+	}
+	return nil
+}
+
+func buildPES(payload []byte, pts90k uint64) []byte {
+	pes := make([]byte, 14+len(payload))
+	copy(pes[0:4], []byte{0, 0, 1, 0xe0})
+	packetLen := len(payload) + 8
+	if packetLen > 0xffff {
+		packetLen = 0
+	}
+	binary.BigEndian.PutUint16(pes[4:6], uint16(packetLen))
+	pes[6] = 0x80
+	pes[7] = 0x80
+	pes[8] = 0x05
+	writePTS(pes[9:14], pts90k)
+	copy(pes[14:], payload)
+	return pes
+}
+
+func writePTS(dst []byte, pts uint64) {
+	pts &= (1 << 33) - 1
+	dst[0] = byte(0x21 | ((pts >> 29) & 0x0e))
+	dst[1] = byte(pts >> 22)
+	dst[2] = byte(0x01 | ((pts >> 14) & 0xfe))
+	dst[3] = byte(pts >> 7)
+	dst[4] = byte(0x01 | ((pts << 1) & 0xfe))
+}
+
+func writePCR(dst []byte, pts90k uint64) {
+	base := pts90k & ((1 << 33) - 1)
+	ext := uint64(0)
+	dst[0] = byte(base >> 25)
+	dst[1] = byte(base >> 17)
+	dst[2] = byte(base >> 9)
+	dst[3] = byte(base >> 1)
+	dst[4] = byte((base&1)<<7 | 0x7e | (ext >> 8))
+	dst[5] = byte(ext)
+}
+
+func buildPATPacket() [188]byte {
+	var p [188]byte
+	p[0], p[1], p[2], p[3], p[4] = 0x47, 0x40, 0x00, 0x10, 0x00
+	section := []byte{0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe0, 0x00}
+	copy(p[5:], section)
+	binary.BigEndian.PutUint32(p[17:21], mpegCRC32(section))
+	for i := 21; i < len(p); i++ {
+		p[i] = 0xff
+	}
+	return p
+}
+
+func buildPMTPacket() [188]byte {
+	var p [188]byte
+	p[0] = 0x47
+	p[1] = 0x50 | byte((tsPIDPMT>>8)&0x1f)
+	p[2] = byte(tsPIDPMT & 0xff)
+	p[3] = 0x10
+	p[4] = 0x00
+	section := []byte{
+		0x02, 0xb0, 0x12, 0x00, 0x01, 0xc1, 0x00, 0x00,
+		0xe1, 0x00, 0xf0, 0x00,
+		0x1b, 0xe0 | byte((tsPIDVideo>>8)&0x1f), byte(tsPIDVideo & 0xff), 0xf0, 0x00,
+	}
+	copy(p[5:], section)
+	binary.BigEndian.PutUint32(p[22:26], mpegCRC32(section))
+	for i := 26; i < len(p); i++ {
+		p[i] = 0xff
+	}
+	return p
+}
+
+func mpegCRC32(b []byte) uint32 {
+	crc := uint32(0xffffffff)
+	for _, c := range b {
+		crc ^= uint32(c) << 24
+		for i := 0; i < 8; i++ {
+			if crc&0x80000000 != 0 {
+				crc = (crc << 1) ^ 0x04c11db7
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
+
+func parseHTTPHeaders(b []byte) map[string]string {
+	out := map[string]string{}
+	lines := strings.Split(string(b), "\r\n")
+	for _, line := range lines[1:] {
+		p := strings.SplitN(line, ":", 2)
+		if len(p) == 2 {
+			out[strings.ToLower(strings.TrimSpace(p[0]))] = strings.TrimSpace(p[1])
+		}
+	}
+	return out
+}
+
+func localIPFor(targetIP string) string {
+	target := net.ParseIP(strings.TrimSpace(targetIP))
+	if target == nil || target.To4() == nil || target.IsLoopback() || target.IsUnspecified() {
+		return ""
+	}
+	c, err := net.DialTimeout("udp4", net.JoinHostPort(target.To4().String(), "1900"), time.Second)
+	if err == nil {
+		defer c.Close()
+		if addr, ok := c.LocalAddr().(*net.UDPAddr); ok && addr != nil && addr.IP != nil && !addr.IP.IsLoopback() && !addr.IP.IsUnspecified() {
+			if ip := addr.IP.To4(); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	// Fallback for hosts where UDP connect cannot establish a route before the
+	// TV is reachable: choose a non-loopback IPv4 interface on the same subnet.
+	t4 := target.To4()
+	interfaces, _ := net.Interfaces()
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			var ipnet *net.IPNet
+			switch v := a.(type) {
+			case *net.IPNet:
+				ipnet = v
+			case *net.IPAddr:
+				ipnet = &net.IPNet{IP: v.IP, Mask: net.CIDRMask(24, 32)}
+			}
+			if ipnet == nil || ipnet.IP == nil {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+				continue
+			}
+			if ipnet.Contains(t4) {
+				return ip.String()
+			}
+		}
+	}
+	return ""
+}
+
+func xmlEscape(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
+func getenvInt(k string, d int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return d
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return d
+	}
+	return n
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+func flusherSafeFlush(f http.Flusher) {
+	if f != nil {
+		f.Flush()
 	}
 }
 

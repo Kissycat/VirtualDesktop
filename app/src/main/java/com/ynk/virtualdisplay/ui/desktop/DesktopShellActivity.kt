@@ -31,6 +31,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.content.ActivityNotFoundException
 import android.util.Log
 import android.widget.PopupWindow
 import android.widget.BaseAdapter
@@ -44,6 +45,8 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import com.ynk.virtualdisplay.domain.DisplayInteractor
+import com.ynk.virtualdisplay.webrtc.GatewayProcessController
+import com.ynk.virtualdisplay.ui.display.DisplayActivity
 import com.ynk.virtualdisplay.data.repository.RecentAppHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -156,6 +159,7 @@ class DesktopShellActivity : ComponentActivity() {
     }
 
     internal val displayInteractor: DisplayInteractor by inject()
+    private val gatewayProcessController: GatewayProcessController by inject()
     // Retained only for backward-compatible helper code; Freeform decoration is no longer started.
     private val desktopWindows = LinkedHashSet<FreeformOverlayDecoration>()
     internal var desktopDisplayId: Int = Display.DEFAULT_DISPLAY
@@ -199,6 +203,8 @@ class DesktopShellActivity : ComponentActivity() {
     private var desktopWindowLayer: FrameLayout? = null
     private var desktopWindowOverlayHost: DesktopWindowOverlayHost? = null
     private var desktopTaskbar: View? = null
+    private var dockClock: TextView? = null
+    private var dockClockJob: Job? = null
     private var dockOverlayWindowManager: WindowManager? = null
     private var dockOverlayAttached = false
     private var dockOverlayVisible = false
@@ -286,7 +292,7 @@ class DesktopShellActivity : ComponentActivity() {
         })
 
         val clock = TextView(this).apply {
-            text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+            text = currentDockClockText()
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             gravity = Gravity.CENTER
@@ -296,6 +302,8 @@ class DesktopShellActivity : ComponentActivity() {
         }
         taskbar.addView(clock, LinearLayout.LayoutParams(dp(90), dp(52)))
 
+        dockClock = clock
+        startDockClockUpdates()
         desktopTaskbar = taskbar
         root.addView(taskbar, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(68)
@@ -379,12 +387,32 @@ class DesktopShellActivity : ComponentActivity() {
     internal fun desktopDpiPublic(): Int = desktopPrefs.getInt(PREF_DESKTOP_DPI, 160)
     internal fun desktopDockHeightPublic(): Int = dp(68)
 
+    private fun currentDockClockText(): String =
+        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+
+    private fun startDockClockUpdates() {
+        dockClockJob?.cancel()
+        dockClockJob = lifecycleScope.launch {
+            // Refresh on the next minute boundary, then exactly once per minute.
+            val now = System.currentTimeMillis()
+            val delayToNextMinute = 60_000L - (now % 60_000L)
+            delay(delayToNextMinute.coerceIn(250L, 60_000L))
+            while (isActive && !isFinishing && !isDestroyed) {
+                dockClock?.text = currentDockClockText()
+                delay(60_000L)
+            }
+        }
+    }
+
     override fun onDestroy() {
         Log.w("DesktopShell", "onDestroy: shell is actually being destroyed; releasing child windows")
         // Release desktop-window resources only when the shell Activity is truly destroyed.
         closeAppDrawer()
         taskbarMonitorJob?.cancel()
         taskbarMonitorJob = null
+        dockClockJob?.cancel()
+        dockClockJob = null
+        dockClock = null
         dockAnimation?.cancel()
         dockAnimation = null
         desktopTaskbar?.let { dock ->
@@ -755,7 +783,7 @@ class DesktopShellActivity : ComponentActivity() {
         }
         val scroll = android.widget.HorizontalScrollView(displayContext).apply {
             isHorizontalScrollBarEnabled = false
-            isSmoothScrollingEnabled = true
+            isSmoothScrollingEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
             addView(recentRow, ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, rowHeight - dp(12)))
@@ -1161,6 +1189,10 @@ class DesktopShellActivity : ComponentActivity() {
             header.addView(title, LinearLayout.LayoutParams(0, dp(38), 1f))
             popupContent.addView(header)
 
+            addContextAction(popupContent, "DLNA 投屏", android.R.drawable.ic_menu_share, action = {
+                popup.dismiss()
+                toggleDesktopDlna()
+            })
             addContextAction(popupContent, "修改壁纸", android.R.drawable.ic_menu_gallery, action = {
                 popup.dismiss()
                 showWallpaperMenu()
@@ -1258,6 +1290,67 @@ class DesktopShellActivity : ComponentActivity() {
             }.onFailure {
                 Log.e("DesktopSettingsMenu", "SHOW_FAILED", it)
             }
+        }
+    }
+
+    /**
+     * Start/reuse the same bundled GO WebRTC gateway used by the floating WebRTC
+     * control, then open its DLNA control page. The first menu invocation keeps
+     * local playback intact; once the gateway is already running, a subsequent
+     * invocation suppresses the local preview just like the floating control.
+     */
+    private fun toggleDesktopDlna() {
+        val displayId = desktopDisplayId
+        if (displayId < 0) {
+            Toast.makeText(this, "无有效虚拟屏幕", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val running = gatewayProcessController.isRunning()
+            if (running) {
+                DisplayActivity.setLocalPreviewSuppressedForDisplay(displayId, true)
+                runOnUiThread {
+                    Toast.makeText(this@DesktopShellActivity, "已按 WebRTC 控制隐藏本机画面", Toast.LENGTH_SHORT).show()
+                }
+                return@launch
+            }
+
+            val expectedWidth = display?.width?.takeIf { it > 0 } ?: 0
+            val expectedHeight = display?.height?.takeIf { it > 0 } ?: 0
+            val result = gatewayProcessController.start(
+                displayId = displayId,
+                gatewayPort = GatewayProcessController.DEFAULT_GATEWAY_PORT,
+                bindHost = "0.0.0.0",
+                expectedWidth = expectedWidth,
+                expectedHeight = expectedHeight,
+            )
+            result.onSuccess {
+                runOnUiThread {
+                    openDlnaPage()
+                    Toast.makeText(this@DesktopShellActivity, "DLNA 网关已启动，本机画面保持显示", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure { error ->
+                Log.e("DesktopShell", "Failed to start DLNA gateway", error)
+                runOnUiThread {
+                    Toast.makeText(this@DesktopShellActivity, "DLNA 网关启动失败：${error.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun openDlnaPage() {
+        val uri = Uri.parse("http://127.0.0.1:${GatewayProcessController.DEFAULT_GATEWAY_PORT}/dlna")
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "系统没有可用的浏览器或 WebView", Toast.LENGTH_LONG).show()
+        } catch (t: Throwable) {
+            Log.e("DesktopShell", "Failed to open DLNA page", t)
+            Toast.makeText(this, "无法打开 DLNA 页面：${t.message}", Toast.LENGTH_LONG).show()
         }
     }
 
