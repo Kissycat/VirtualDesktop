@@ -27,9 +27,209 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
+/*
+#cgo LDFLAGS: -Wl,-Bstatic -L../../usr/lib -lopus -lfdk-aac -Wl,-Bdynamic -lm
+#include <opus/opus.h>
+#include <fdk-aac/aacenc_lib.h>
+#include <stdlib.h>
+
+typedef struct {
+    OpusDecoder *opus_dec;
+    HANDLE_AACENCODER aac_enc;
+    int channels;
+    int sample_rate;
+    int frame_samples;
+    short *pcm_fifo;
+    int pcm_fifo_samples;
+    int pcm_fifo_capacity;
+} OpusToAACTranscoder;
+
+static OpusToAACTranscoder* init_transcoder(int sample_rate, int channels, int bitrate) {
+    OpusToAACTranscoder *t = (OpusToAACTranscoder*)calloc(1, sizeof(OpusToAACTranscoder));
+    if (!t) return NULL;
+
+    t->channels = channels;
+    t->sample_rate = sample_rate;
+    t->frame_samples = 1024 * channels;
+    // Keep several AAC frames of interleaved PCM so that each call to the
+    // encoder always receives complete 1024-sample/channel blocks.
+    t->pcm_fifo_capacity = 12288 * channels;
+    t->pcm_fifo = (short*)calloc((size_t)t->pcm_fifo_capacity, sizeof(short));
+    if (!t->pcm_fifo) {
+        free(t);
+        return NULL;
+    }
+
+    int err = OPUS_OK;
+    t->opus_dec = opus_decoder_create(sample_rate, channels, &err);
+    if (err != OPUS_OK || !t->opus_dec) {
+        free(t->pcm_fifo);
+        free(t);
+        return NULL;
+    }
+
+    CHANNEL_MODE mode = (channels == 1) ? MODE_1 : MODE_2;
+    if (aacEncOpen(&t->aac_enc, 0, channels) != AACENC_OK) {
+        opus_decoder_destroy(t->opus_dec);
+        free(t->pcm_fifo);
+        free(t);
+        return NULL;
+    }
+
+    if (aacEncoder_SetParam(t->aac_enc, AACENC_AOT, 2) != AACENC_OK ||
+        aacEncoder_SetParam(t->aac_enc, AACENC_SAMPLERATE, sample_rate) != AACENC_OK ||
+        aacEncoder_SetParam(t->aac_enc, AACENC_CHANNELMODE, mode) != AACENC_OK ||
+        aacEncoder_SetParam(t->aac_enc, AACENC_CHANNELORDER, 1) != AACENC_OK ||
+        aacEncoder_SetParam(t->aac_enc, AACENC_BITRATE, bitrate) != AACENC_OK ||
+        aacEncoder_SetParam(t->aac_enc, AACENC_TRANSMUX, 2) != AACENC_OK ||
+        aacEncoder_SetParam(t->aac_enc, AACENC_AFTERBURNER, 1) != AACENC_OK) {
+        aacEncClose(&t->aac_enc);
+        opus_decoder_destroy(t->opus_dec);
+        free(t->pcm_fifo);
+        free(t);
+        return NULL;
+    }
+
+    if (aacEncEncode(t->aac_enc, NULL, NULL, NULL, NULL) != AACENC_OK) {
+        aacEncClose(&t->aac_enc);
+        opus_decoder_destroy(t->opus_dec);
+        free(t->pcm_fifo);
+        free(t);
+        return NULL;
+    }
+
+    return t;
+}
+
+static int transcode_frame(OpusToAACTranscoder *t,
+                           const unsigned char *opus_data, int opus_len,
+                           unsigned char *aac_out, int max_aac_out) {
+    if (!t || !t->opus_dec || !t->aac_enc || !opus_data || opus_len <= 0 ||
+        !aac_out || max_aac_out <= 0) {
+        return -1;
+    }
+
+    // 120 ms is the maximum Opus frame size accepted by opus_decode().
+    short pcm[5760 * 2];
+    int decoded_samples = opus_decode(t->opus_dec, opus_data, opus_len, pcm, 5760, 0);
+    if (decoded_samples < 0) {
+        return -2;
+    }
+
+    int decoded_total = decoded_samples * t->channels;
+    if (decoded_total <= 0 || decoded_total > t->pcm_fifo_capacity - t->pcm_fifo_samples) {
+        return -3;
+    }
+    memcpy(t->pcm_fifo + t->pcm_fifo_samples, pcm,
+           (size_t)decoded_total * sizeof(short));
+    t->pcm_fifo_samples += decoded_total;
+
+    int total_out = 0;
+
+    // FDK's input is a stream of interleaved PCM samples. Feed complete AAC
+    // frame-sized blocks and retain anything not yet consumable.
+    while (t->pcm_fifo_samples >= t->frame_samples && total_out < max_aac_out) {
+        void *in_buffer = t->pcm_fifo;
+        int in_identifier = IN_AUDIO_DATA;
+        int in_size = t->frame_samples * (int)sizeof(short);
+        int in_elem_size = (int)sizeof(short);
+        AACENC_BufDesc in_buf = {1, &in_buffer, &in_identifier, &in_size, &in_elem_size};
+        AACENC_InArgs in_args = {0};
+        AACENC_OutArgs out_args = {0};
+        in_args.numInSamples = t->frame_samples;
+
+        void *out_buffer = aac_out + total_out;
+        int out_identifier = OUT_BITSTREAM_DATA;
+        int out_size = max_aac_out - total_out;
+        int out_elem_size = 1;
+        AACENC_BufDesc out_buf = {1, &out_buffer, &out_identifier, &out_size, &out_elem_size};
+
+        AACENC_ERROR enc_err = aacEncEncode(t->aac_enc, &in_buf, &out_buf, &in_args, &out_args);
+        if (enc_err != AACENC_OK && enc_err != AACENC_ENCODE_EOF) {
+            return total_out > 0 ? total_out : -4;
+        }
+
+        int consumed = out_args.numInSamples;
+        if (consumed < 0 || consumed > t->pcm_fifo_samples) {
+            return total_out > 0 ? total_out : -5;
+        }
+        if (consumed > 0) {
+            memmove(t->pcm_fifo,
+                    t->pcm_fifo + consumed,
+                    (size_t)(t->pcm_fifo_samples - consumed) * sizeof(short));
+            t->pcm_fifo_samples -= consumed;
+        } else {
+            // Avoid spinning forever if the encoder cannot consume the block.
+            break;
+        }
+
+        if (out_args.numOutBytes > 0) {
+            total_out += out_args.numOutBytes;
+        }
+
+        // A single call should normally consume the complete supplied block.
+        // If it consumed only part of it, retry with the retained samples.
+        if (consumed < t->frame_samples) {
+            break;
+        }
+    }
+
+    return total_out;
+}
+
+static void free_transcoder(OpusToAACTranscoder *t) {
+    if (!t) return;
+    if (t->opus_dec) opus_decoder_destroy(t->opus_dec);
+    if (t->aac_enc) aacEncClose(&t->aac_enc);
+    free(t->pcm_fifo);
+    free(t);
+}
+*/
+import "C"
+import "unsafe"
+
+type AudioTranscoder struct {
+	ptr *C.OpusToAACTranscoder
+}
+
+func NewAudioTranscoder(sampleRate, channels, bitrate int) *AudioTranscoder {
+	ptr := C.init_transcoder(C.int(sampleRate), C.int(channels), C.int(bitrate))
+	if ptr == nil {
+		return nil
+	}
+	return &AudioTranscoder{ptr: ptr}
+}
+
+func (t *AudioTranscoder) Transcode(opusData []byte) []byte {
+	if t == nil || t.ptr == nil || len(opusData) == 0 {
+		return nil
+	}
+	buf := make([]byte, 8192)
+	outLen := C.transcode_frame(
+		t.ptr,
+		(*C.uchar)(unsafe.Pointer(&opusData[0])),
+		C.int(len(opusData)),
+		(*C.uchar)(unsafe.Pointer(&buf[0])),
+		C.int(len(buf)),
+	)
+	if outLen <= 0 {
+		return nil
+	}
+	return buf[:outLen]
+}
+
+func (t *AudioTranscoder) Close() {
+	if t != nil && t.ptr != nil {
+		C.free_transcoder(t.ptr)
+		t.ptr = nil
+	}
+}
+
 const (
 	// Built-in scrcpy daemon roles used by this video-only gateway.
 	roleVideo       = 0
+	roleAudio       = 1
+	roleControl     = 2
 	roleNegotiation = 3
 
 	// Current daemon protocol message.
@@ -50,10 +250,12 @@ const (
 	flagConfig   = 1 << 0
 	flagKeyFrame = 1 << 1
 
-	defaultH264ProfileLevelID = "42e032"
-	frameHistoryWindow        = 10 * time.Second
-	frameHistoryMaxFrames     = 1200
-	maxFramePayload           = 32 * 1024 * 1024
+	defaultH264ProfileLevelID        = "42e032"
+	frameHistoryWindow               = 4 * time.Second
+	frameHistoryMaxFrames            = 600
+	maxFramePayload                  = 32 * 1024 * 1024
+	maxAudioPayload                  = 4 * 1024 * 1024
+	audioCodecOpusID          uint32 = 0x6f707573
 
 	// DLNA/UPnP defaults. DLNA consumes a live MPEG-TS resource over HTTP;
 	// the gateway does not decode or re-encode the scrcpy H.264 stream.
@@ -61,11 +263,9 @@ const (
 	dlnaStreamPath        = "/dlna/stream.ts"
 	dlnaControlTimeout    = 4 * time.Second
 	dlnaHTTPTimeout       = 8 * time.Second
-	dlnaPlaybackDelay     = 3 * time.Second
-	dlnaFlushInterval     = 100 * time.Millisecond
-	dlnaHTTPWriteBuffer   = 256 * 1024
 
 	tsPIDVideo uint16 = 0x0100
+	tsPIDAudio uint16 = 0x0101
 	tsPIDPMT   uint16 = 0x1000
 	tsPCRBase  uint64 = 90000
 )
@@ -80,6 +280,8 @@ const browserHTML = `<!doctype html>
 html,body{margin:0;width:100%;height:100%;background:#111;color:#ddd;font-family:system-ui,sans-serif;overflow:hidden}
 body{display:flex;flex-direction:column}
 #bar{height:38px;display:flex;align-items:center;gap:12px;padding:0 12px;background:#202020;box-sizing:border-box;font-size:13px}
+:fullscreen #bar{display:none!important}
+:-webkit-full-screen #bar{display:none!important}
 #status{color:#9ad}
 button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:5px 10px;cursor:pointer}
 #wrap{position:relative;flex:1;min-height:0;overflow:hidden;background:#000}
@@ -90,7 +292,7 @@ button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;paddin
 </style>
 </head>
 <body>
-<div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><button id="reconnect">Reconnect</button><a href="/dlna" style="color:#9ad;text-decoration:none">DLNA投屏</a></div>
+<div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><label><input id="audioEnabled" type="checkbox" checked>音频</label><button id="soundBtn">🔊声音</button><audio id="audioOut" autoplay playsinline></audio><button id="reconnect">Reconnect</button><button id="fullscreenBtn">全屏</button><a href="/dlna" style="color:#9ad;text-decoration:none">DLNA投屏</a></div>
 <div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"></div></div>
 <script>
 const video=document.getElementById('video');
@@ -98,6 +300,10 @@ const wrap=document.getElementById('wrap');
 const cursor=document.getElementById('cursor');
 const status=document.getElementById('status');
 const bar=document.getElementById('bar');
+const audioEnabled=document.getElementById('audioEnabled');
+const soundBtn=document.getElementById('soundBtn');
+const audioOut=document.getElementById('audioOut');
+const fullscreenBtn=document.getElementById('fullscreenBtn');
 let pc=null;
 let expectedW=0, expectedH=0;
 let sourceW=0, sourceH=0;
@@ -108,7 +314,7 @@ function setStatus(s){
   status.textContent=s;
   console.log('[WebRTC]',s);
   // 当连接成功时隐藏状态栏，其他异常/加载状态则显示
-  if(s === 'connected' || s === 'PC: connected') {
+  if((s === 'connected' || s === 'PC: connected') && !audioEnabled.checked) {
     bar.style.display = 'none';
     // 隐藏状态栏后，留出时间让DOM更新，并重新计算视频画面的布局以铺满全屏
     setTimeout(applyVideoLayout, 50); 
@@ -186,8 +392,27 @@ async function pollCursor(){
   requestAnimationFrame(()=>setTimeout(pollCursor,33));
 }
 
+async function enterFullscreen(){
+  try{
+    if(!document.fullscreenElement){
+      await (wrap.requestFullscreen?wrap.requestFullscreen():video.requestFullscreen());
+    }else if(document.exitFullscreen){
+      await document.exitFullscreen();
+    }
+  }catch(e){ console.warn('[WebRTC-FS] fullscreen failed',e); }
+}
+function updateFullscreenUI(){
+  const fs=!!document.fullscreenElement;
+  if(fullscreenBtn) fullscreenBtn.textContent=fs?'退出全屏':'全屏';
+  setTimeout(applyVideoLayout,50);
+}
+fullscreenBtn.onclick=enterFullscreen;
+wrap.addEventListener('dblclick',enterFullscreen);
+document.addEventListener('fullscreenchange',updateFullscreenUI);
 window.addEventListener('resize',applyVideoLayout);
 document.getElementById('reconnect').onclick=()=>start(true);
+soundBtn.onclick=async()=>{audioEnabled.checked=true;audioOut.muted=false;try{await audioOut.play();}catch(e){console.warn('[WebRTC-AUDIO] manual play failed',e)}};
+audioEnabled.onchange=()=>{audioOut.muted=!audioEnabled.checked;start(true).catch(()=>{})};
 let autoRetryTimer=null;
 let starting=false;
 function scheduleAutoReconnect(delay=1200){
@@ -201,11 +426,18 @@ async function start(auto=false){
     if(pc){try{pc.close()}catch(e){}pc=null;}
     setStatus('creating peer...');
     pc=new RTCPeerConnection({iceServers:[]});
+    const audioOn=audioEnabled.checked;
     pc.addTransceiver('video',{direction:'recvonly'});
+    if(audioOn) pc.addTransceiver('audio',{direction:'recvonly'});
     pc.ontrack=e=>{
-      video.srcObject=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);
-      video.play().catch(()=>{});
-      applyVideoLayout();
+      const stream=(e.streams&&e.streams[0])?e.streams[0]:new MediaStream([e.track]);
+      if(e.track.kind==='audio'){
+        console.log('[WebRTC-AUDIO] remote audio track received');
+        audioOut.srcObject=stream; audioOut.muted=false;
+        audioOut.play().then(()=>console.log('[WebRTC-AUDIO] playback started')).catch(err=>console.warn('[WebRTC-AUDIO] autoplay blocked',err));
+      }else{
+        video.srcObject=stream; video.play().catch(()=>{}); applyVideoLayout();
+      }
     };
     video.onloadedmetadata=()=>{
       sourceW=video.videoWidth; sourceH=video.videoHeight;
@@ -232,7 +464,8 @@ async function start(auto=false){
         if(pc.iceGatheringState==='complete'){clearTimeout(timer);resolve();}
       };
     });
-    const res=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
+    console.log('[WebRTC-AUDIO] offer audio='+audioOn);
+    const res=await fetch('/offer?audio='+(audioOn?'1':'0'),{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription.sdp});
     if(!res.ok)throw new Error('HTTP '+res.status+' '+await res.text());
     await pc.setRemoteDescription({type:'answer',sdp:await res.text()});
     await refreshStatus();
@@ -270,75 +503,79 @@ label{font-size:14px;color:#aaa;min-width:90px}
 input{flex:1;box-sizing:border-box;background:#111;color:#eee;border:1px solid #555;border-radius:6px;padding:10px 12px;font-size:15px}
 button{background:#333;color:#eee;border:1px solid #666;border-radius:6px;padding:9px 14px;cursor:pointer}
 button:hover{background:#444}
-button:disabled{opacity:.5;cursor:default}
 #status{margin-top:16px;min-height:24px;color:#9ad;white-space:pre-wrap;word-break:break-word}
 .hint{font-size:12px;color:#888;line-height:1.5;margin-top:14px}
 a{color:#9ad}
-#devices{margin-top:18px}.device{padding:12px;border:1px solid #444;border-radius:8px;margin:8px 0;background:#181818;cursor:pointer}.device:hover{background:#272727}.device .name{font-size:15px;color:#eee}.device .meta{font-size:12px;color:#888;margin-top:4px}
 </style>
 </head>
 <body>
 <div class="card">
 <h1>DLNA 投屏</h1>
-<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><button id="scan">搜索设备</button></div>
-<div id="devices"><div class="hint">正在搜索局域网 DLNA Renderer...</div></div>
+<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><button id="dlnaSearch">搜索设备</button></div>
+<div id="deviceList" style="margin:8px 0 14px"></div>
 <div class="row">
-<button id="dlnaStart">按 IP 投屏</button>
+<button id="dlnaStart">开始投屏</button>
 <button id="dlnaStop">停止投屏</button>
 <a href="/">返回 WebRTC</a>
 </div>
 <div id="status">准备就绪</div>
-<div class="hint">下方会列出自动发现的 DLNA Renderer，点击设备即可投屏。也可以手动输入 Renderer IP；自动发现失败时不影响按 IP 投屏。</div>
+<div class="hint">可直接输入电视 IP，也可以点击“搜索设备”查看局域网内检测到的 DLNA 播放器候选。点击候选即可填入 IP；投屏链路及转码实现保持不变。</div>
 </div>
 <script>
 const ip=document.getElementById('dlnaIp');
 const status=document.getElementById('status');
 const start=document.getElementById('dlnaStart');
 const stop=document.getElementById('dlnaStop');
-const scan=document.getElementById('scan');
-const devices=document.getElementById('devices');
+const search=document.getElementById('dlnaSearch');
+const deviceList=document.getElementById('deviceList');
 function setStatus(s){status.textContent=s;}
+function renderDevices(devices){
+  deviceList.innerHTML='';
+  if(!devices || !devices.length){
+    deviceList.innerHTML='<div style="padding:10px 12px;border:1px dashed #444;border-radius:6px;color:#888;font-size:13px">未发现 DLNA 播放设备</div>';
+    return;
+  }
+  for(const d of devices){
+    const b=document.createElement('button');
+    b.style.cssText='display:block;width:100%;text-align:left;margin:6px 0;padding:10px 12px;background:#181818;border:1px solid #444;border-radius:6px;color:#ddd;cursor:pointer';
+    const title=d.friendlyName || d.modelName || 'DLNA Renderer';
+    b.textContent=title+'  ['+d.ip+']';
+    b.onclick=()=>{ip.value=d.ip;setStatus('已选择 '+title+' ('+d.ip+')');};
+    deviceList.appendChild(b);
+  }
+}
+async function searchDevices(){
+  search.disabled=true; setStatus('正在搜索局域网 DLNA 设备...');
+  try{
+    const r=await fetch('/dlna/discover',{cache:'no-store'});
+    const t=await r.text();
+    if(!r.ok)throw new Error(t);
+    const x=JSON.parse(t);
+    renderDevices(x.devices||[]);
+    setStatus((x.devices||[]).length ? '发现 '+x.devices.length+' 个设备，请选择。' : '未发现 DLNA 播放设备');
+  }catch(e){setStatus('搜索失败：'+e.message)} finally{search.disabled=false;}
+}
 async function loadStatus(){
-  try{const r=await fetch('/dlna/status',{cache:'no-store'}); if(!r.ok)return; const x=await r.json(); if(x.target)ip.value=x.target; if(x.active)setStatus('投屏中\n'+x.target+'\n'+x.url); else if(x.error)setStatus('失败：'+x.error);}
+  try{const r=await fetch('/dlna/status',{cache:'no-store'}); if(!r.ok)return; const x=await r.json(); if(x.target)ip.value=x.target; if(x.active)setStatus('投屏中\n'+x.url);}
   catch(e){}
 }
-async function cast(v){
-  v=(v||'').trim(); if(!v){setStatus('请输入电视 IP');return;}
-  ip.value=v; setStatus('正在连接 '+v+' ...'); start.disabled=true;
+search.onclick=searchDevices;
+start.onclick=async()=>{
+  const v=ip.value.trim(); if(!v){setStatus('请输入电视 IP');return;}
+  setStatus('正在连接 '+v+' ...'); start.disabled=true;
   try{
     const r=await fetch('/dlna/cast',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:v})});
     const t=await r.text(); if(!r.ok)throw new Error(t);
     let x={}; try{x=JSON.parse(t)}catch(e){}
     setStatus('投屏已启动\n'+(x.url||''));
   }catch(e){setStatus('失败：'+e.message)} finally{start.disabled=false;}
-}
-start.onclick=()=>cast(ip.value);
+};
 stop.onclick=async()=>{
   stop.disabled=true;
   try{const r=await fetch('/dlna/stop',{method:'POST'}); const t=await r.text(); if(!r.ok)throw new Error(t); setStatus('已停止投屏');}
   catch(e){setStatus('失败：'+e.message)} finally{stop.disabled=false;}
 };
-async function scanDevices(){
-  scan.disabled=true; devices.innerHTML='<div class="hint">正在搜索局域网 DLNA Renderer...</div>';
-  try{
-    const r=await fetch('/dlna/devices',{cache:'no-store'}); if(!r.ok)throw new Error(await r.text());
-    const x=await r.json(); const list=x.devices||[];
-    if(!list.length){devices.innerHTML='<div class="hint">没有自动发现 DLNA Renderer，可以直接输入 IP。</div>';return;}
-    devices.innerHTML='';
-    for(const d of list){
-      const el=document.createElement('div'); el.className='device';
-      el.innerHTML='<div class="name"></div><div class="meta"></div>';
-      el.querySelector('.name').textContent=d.name||'DLNA Renderer';
-      el.querySelector('.meta').textContent=(d.ip||'')+' · '+(d.serviceType||'AVTransport');
-      el.onclick=()=>cast(d.ip);
-      devices.appendChild(el);
-    }
-  }catch(e){devices.innerHTML='<div class="hint">搜索失败：'+e.message+'</div>'}
-  finally{scan.disabled=false;}
-}
-scan.onclick=scanDevices;
 loadStatus();
-scanDevices();
 setInterval(loadStatus,2000);
 </script>
 </body>
@@ -407,6 +644,22 @@ type h264Source struct {
 	recoveryCount    uint64
 	cursor           cursorState
 
+	// Audio diagnostics/state.
+	audioEnabled   bool
+	audioMu        sync.Mutex
+	audioConn      net.Conn
+	audioSeq       uint64
+	audioChanged   chan struct{}
+	audioHistory   []*audioFrame
+	audioFrames    uint64
+	audioBytes     uint64
+	lastAudioAt    time.Time
+	lastAudioSize  int
+	audioCodecID   uint32
+	audioProtocol  string
+	audioStarted   bool
+	audioLastError string
+
 	dlnaMu       sync.Mutex
 	dlnaCancel   context.CancelFunc
 	dlnaTargetIP string
@@ -422,6 +675,7 @@ func main() {
 	flagExpectedWidth := flag.Int("expected-width", -1, "expected virtual display width; overrides EXPECTED_WIDTH")
 	flagExpectedHeight := flag.Int("expected-height", -1, "expected virtual display height; overrides EXPECTED_HEIGHT")
 	flagCursorURL := flag.String("cursor-url", "", "cursor JSON endpoint; overrides CURSOR_URL")
+	flagAudio := flag.Bool("audio", true, "enable scrcpy audio capture and WebRTC audio")
 	flag.Parse()
 
 	daemonAddr := getenv("DAEMON_ADDR", "127.0.0.1:27183")
@@ -465,7 +719,12 @@ func main() {
 	}
 
 	source := newH264Source(daemonAddr, token, displayID, expectedWidth, expectedHeight)
+	source.audioEnabled = *flagAudio
+	log.Printf("[AUDIO-DIAG] client audio enabled=%t", source.audioEnabled)
 	go source.run()
+	if source.audioEnabled {
+		go source.runAudio()
+	}
 	if cursorURL != "" {
 		go source.pollCursorURL(cursorURL)
 	}
@@ -485,7 +744,7 @@ func main() {
 	mux.HandleFunc("/dlna/cast", func(w http.ResponseWriter, r *http.Request) { handleDLNACast(source, w, r) })
 	mux.HandleFunc("/dlna/stop", func(w http.ResponseWriter, r *http.Request) { handleDLNAStop(source, w, r) })
 	mux.HandleFunc("/dlna/status", func(w http.ResponseWriter, r *http.Request) { handleDLNAStatus(source, w, r) })
-	mux.HandleFunc("/dlna/devices", handleDLNADevices)
+	mux.HandleFunc("/dlna/discover", func(w http.ResponseWriter, r *http.Request) { handleDLNADiscover(w, r) })
 	mux.HandleFunc(dlnaStreamPath, func(w http.ResponseWriter, r *http.Request) { source.serveDLNAStream(w, r) })
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -546,6 +805,15 @@ type debugStatus struct {
 		KeyFramesSent  uint64 `json:"keyFramesSent"`
 		ConfigSent     uint64 `json:"configSent"`
 		WaitedNoConfig uint64 `json:"waitedNoConfig"`
+		AudioEnabled   bool   `json:"audioEnabled"`
+		AudioCodecID   uint32 `json:"audioCodecId"`
+		AudioProtocol  string `json:"audioProtocol,omitempty"`
+		AudioFrames    uint64 `json:"audioFrames"`
+		AudioBytes     uint64 `json:"audioBytes"`
+		LastAudioSize  int    `json:"lastAudioSize"`
+		LastAudioAt    string `json:"lastAudioAt,omitempty"`
+		AudioStarted   bool   `json:"audioStarted"`
+		AudioError     string `json:"audioError,omitempty"`
 	} `json:"source"`
 	WebRTC struct {
 		Note string `json:"note,omitempty"`
@@ -582,6 +850,17 @@ func handleDebugStatus(src *h264Source, w http.ResponseWriter, r *http.Request) 
 	st.Source.KeyFramesSent = src.keyFramesSent
 	st.Source.ConfigSent = src.configSent
 	st.Source.WaitedNoConfig = src.waitedNoConfig
+	st.Source.AudioEnabled = src.audioEnabled
+	st.Source.AudioCodecID = src.audioCodecID
+	st.Source.AudioProtocol = src.audioProtocol
+	st.Source.AudioFrames = src.audioFrames
+	st.Source.AudioBytes = src.audioBytes
+	st.Source.LastAudioSize = src.lastAudioSize
+	if !src.lastAudioAt.IsZero() {
+		st.Source.LastAudioAt = src.lastAudioAt.Format(time.RFC3339Nano)
+	}
+	st.Source.AudioStarted = src.audioStarted
+	st.Source.AudioError = src.audioLastError
 	src.mu.RUnlock()
 	st.WebRTC.Note = "peer count is not persisted; inspect gateway log for peer state"
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -607,6 +886,9 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	audioWanted := r.URL.Query().Get("audio") != "0"
+	log.Printf("[AUDIO-DIAG] /offer peer=%s audio=%t", r.RemoteAddr, audioWanted)
+
 	// Wait briefly for SPS/PPS. Without codec configuration the browser may
 	// successfully establish WebRTC but cannot initialize its H264 decoder.
 	profile := src.waitProfile(3 * time.Second)
@@ -631,6 +913,16 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	if audioWanted {
+		if err = m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;stereo=1;useinbandfec=1"},
+			PayloadType:        111,
+		}, webrtc.RTPCodecTypeAudio); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// 创建拦截器注册表
@@ -662,6 +954,20 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		_ = pc.Close()
 		return
+	}
+	var audioTrack *webrtc.TrackLocalStaticSample
+	if audioWanted {
+		audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2, SDPFmtpLine: "minptime=10;stereo=1;useinbandfec=1"}, "audio", "virtualdisplay")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			_ = pc.Close()
+			return
+		}
+		if _, err = pc.AddTrack(audioTrack); err != nil {
+			http.Error(w, err.Error(), 500)
+			_ = pc.Close()
+			return
+		}
 	}
 
 	// Drain and inspect RTCP. A PLI/FIR means the browser needs a fresh keyframe.
@@ -699,9 +1005,12 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("peer=%s", s.String())
-		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
+	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
+		log.Printf("peer=%s audio=%t", st.String(), audioWanted)
+		if st == webrtc.PeerConnectionStateConnected && audioWanted {
+			go src.startAudioWhenReady(pc)
+		}
+		if st == webrtc.PeerConnectionStateFailed || st == webrtc.PeerConnectionStateClosed {
 			_ = pc.Close()
 		}
 	})
@@ -731,8 +1040,11 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("WebRTC answer ready: peer=%s profile-level-id=%s", r.RemoteAddr, profile)
+	log.Printf("WebRTC answer ready: peer=%s profile-level-id=%s audio=%t", r.RemoteAddr, profile, audioWanted)
 	go src.pipeTo(track, pc)
+	if audioTrack != nil {
+		go src.pipeAudioTo(audioTrack, pc)
+	}
 	w.Header().Set("Content-Type", "application/sdp")
 	_, _ = io.WriteString(w, local.SDP)
 }
@@ -777,6 +1089,9 @@ func newH264Source(addr, token string, displayID, expectedWidth, expectedHeight 
 		expectedHeight: expectedHeight,
 		header:         h,
 		changed:        make(chan struct{}),
+		audioEnabled:   true,
+		audioChanged:   make(chan struct{}),
+		audioCodecID:   audioCodecOpusID,
 	}
 }
 
@@ -872,14 +1187,25 @@ func (s *h264Source) ensureSession() error {
 
 	options := strings.Join([]string{
 		"video=true",
-		"audio=false",
+		"audio=" + strconv.FormatBool(s.audioEnabled),
+		"audio_codec=opus",
+		// Use Android 13+ playback capture instead of REMOTE_SUBMIX.
+		// audio_dup=true keeps the captured playback audible on the device
+		// while the same audio is forwarded to the WebRTC peer.
+		"audio_source=output",
+		"audio_dup=false",
 		"video_codec=h264",
 		"send_stream_meta=false",
 		"send_frame_meta=true",
 	}, "\n") + "\n"
 
 	const seq = int64(1)
-	if err := writeConfigureSession(c, seq, options, []roleEntry{{role: roleVideo, displayID: int32(s.displayID)}}); err != nil {
+	entries := []roleEntry{{role: roleVideo, displayID: int32(s.displayID)}}
+	if s.audioEnabled {
+		entries = append(entries, roleEntry{role: roleControl, displayID: int32(s.displayID)})
+		entries = append(entries, roleEntry{role: roleAudio, displayID: int32(s.displayID)})
+	}
+	if err := writeConfigureSession(c, seq, options, entries); err != nil {
 		_ = c.Close()
 		return err
 	}
@@ -1150,6 +1476,247 @@ func (s *h264Source) readScrcpyVideoStream(conn net.Conn) error {
 	}
 }
 
+type audioFrame struct {
+	seq        uint64
+	ptsUs      int64
+	data       []byte
+	duration   time.Duration
+	receivedAt time.Time
+}
+
+func (s *h264Source) runAudio() {
+	for {
+		if !s.audioEnabled {
+			time.Sleep(time.Second)
+			continue
+		}
+		if err := s.ensureSession(); err != nil {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		c, err := s.openRoleSocket(roleAudio)
+		if err != nil {
+			s.mu.Lock()
+			s.audioLastError = fmt.Sprintf("open ROLE_AUDIO: %v", err)
+			s.mu.Unlock()
+			log.Printf("[AUDIO-DIAG] ROLE_AUDIO connect failed: %v", err)
+			time.Sleep(700 * time.Millisecond)
+			continue
+		}
+		s.audioMu.Lock()
+		s.audioConn = c
+		s.audioMu.Unlock()
+		log.Printf("[AUDIO-DIAG] ROLE_AUDIO connected displayId=%d", s.displayID)
+		br := bufio.NewReaderSize(c, 256*1024)
+		if err := s.readAudioStream(br); err != nil {
+			s.mu.Lock()
+			s.audioLastError = err.Error()
+			s.mu.Unlock()
+			log.Printf("[AUDIO-DIAG] ROLE_AUDIO stopped: %v", err)
+		}
+		_ = c.Close()
+		s.audioMu.Lock()
+		if s.audioConn == c {
+			s.audioConn = nil
+		}
+		s.audioMu.Unlock()
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func (s *h264Source) readAudioStream(br *bufio.Reader) error {
+	// With send_stream_meta=false, Streamer.writeAudioHeader() deliberately
+	// sends NO 4-byte codec header. The stream starts directly with the
+	// 12-byte frame metadata header. The first 32 bits are the high half of
+	// ptsAndFlags, so a CONFIG packet starts with 0x40000000 (bit 62), which
+	// is exactly what the current server log shows.
+	var first [4]byte
+	if _, err := io.ReadFull(br, first[:]); err != nil {
+		return fmt.Errorf("read initial audio header: %w", err)
+	}
+	firstU := binary.BigEndian.Uint32(first[:])
+
+	// Explicit codec header mode (send_stream_meta=true).
+	if firstU == audioCodecOpusID {
+		s.mu.Lock()
+		s.audioCodecID = firstU
+		s.audioProtocol = "codec-header"
+		s.audioLastError = ""
+		s.mu.Unlock()
+		log.Printf("[AUDIO-DIAG] OPUS codec header received id=0x%08x", firstU)
+		return s.consumeAudioFrames(br, nil)
+	}
+
+	// Disabled-stream codes are only unambiguous when the following 8 bytes
+	// do not form a valid frame header. Otherwise 0/1 can be the high 32 bits
+	// of a real PTS, so parse the complete 12-byte header first.
+	var rest [8]byte
+	_ = s.setAudioReadDeadline(350 * time.Millisecond)
+	n, err := io.ReadFull(br, rest[:])
+	_ = s.clearAudioReadDeadline()
+	if err != nil || n != 8 {
+		if firstU == 1 {
+			return fmt.Errorf("server reported fatal audio error (disable code=1)")
+		}
+		if firstU == 0 {
+			return fmt.Errorf("server disabled audio capture (disable code=0)")
+		}
+		if err != nil {
+			return fmt.Errorf("read initial audio frame meta: %w", err)
+		}
+		return fmt.Errorf("short initial audio frame meta: %d/8 bytes", n)
+	}
+
+	sz := binary.BigEndian.Uint32(rest[4:8])
+	if sz == 0 || sz > maxAudioPayload {
+		if firstU == 0 {
+			return fmt.Errorf("server disabled audio capture (disable code=0)")
+		}
+		if firstU == 1 {
+			return fmt.Errorf("server reported fatal audio error (disable code=1)")
+		}
+		return fmt.Errorf("unsupported audio codec/header 0x%08x nextSize=%d", firstU, sz)
+	}
+
+	s.mu.Lock()
+	s.audioCodecID = audioCodecOpusID
+	s.audioProtocol = "frame-meta-only"
+	s.audioLastError = ""
+	s.mu.Unlock()
+	log.Printf("[AUDIO-DIAG] frame-meta-only stream detected firstHigh32=0x%08x payload=%d", firstU, sz)
+
+	var hdr [12]byte
+	binary.BigEndian.PutUint32(hdr[0:4], firstU)
+	copy(hdr[4:12], rest[:])
+	return s.consumeAudioFrames(br, hdr[:])
+}
+
+func (s *h264Source) consumeAudioFrames(br *bufio.Reader, initial []byte) error {
+	var pending [12]byte
+	havePending := len(initial) == 12
+	if havePending {
+		copy(pending[:], initial)
+	}
+	for {
+		var hdr [12]byte
+		if havePending {
+			copy(hdr[:], pending[:])
+			havePending = false
+		} else if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return fmt.Errorf("read audio frame meta: %w", err)
+		}
+		raw := binary.BigEndian.Uint64(hdr[:8])
+		if raw&(uint64(1)<<63) != 0 {
+			log.Printf("[AUDIO-DIAG] audio session meta %dx%d", binary.BigEndian.Uint32(hdr[4:8]), binary.BigEndian.Uint32(hdr[8:12]))
+			continue
+		}
+		sz := binary.BigEndian.Uint32(hdr[8:12])
+		if sz == 0 || sz > maxAudioPayload {
+			return fmt.Errorf("invalid audio frame size=%d raw=0x%016x", sz, raw)
+		}
+		data := make([]byte, sz)
+		if _, err := io.ReadFull(br, data); err != nil {
+			return fmt.Errorf("read audio payload size=%d: %w", sz, err)
+		}
+		if raw&(uint64(1)<<62) != 0 {
+			log.Printf("[AUDIO-DIAG] audio config packet size=%d skipped", sz)
+			continue
+		}
+		s.recordAudioFrame(int64(raw&((uint64(1)<<61)-1)), data)
+	}
+}
+
+func (s *h264Source) recordAudioFrame(ptsUs int64, data []byte) {
+	s.mu.Lock()
+	s.audioSeq++
+	s.audioHistory = append(s.audioHistory, &audioFrame{
+		seq: s.audioSeq, ptsUs: ptsUs, data: append([]byte(nil), data...),
+		duration: 20 * time.Millisecond, receivedAt: time.Now(),
+	})
+	if len(s.audioHistory) > 400 {
+		s.audioHistory = append([]*audioFrame(nil), s.audioHistory[len(s.audioHistory)-400:]...)
+	}
+	s.audioFrames++
+	s.audioBytes += uint64(len(data))
+	s.lastAudioAt = time.Now()
+	s.lastAudioSize = len(data)
+	s.audioLastError = ""
+	old := s.audioChanged
+	s.audioChanged = make(chan struct{})
+	close(old)
+	n := s.audioFrames
+	s.mu.Unlock()
+	if n <= 5 || n%250 == 0 {
+		log.Printf("[AUDIO-DIAG] OPUS frame #%d pts=%d size=%d", n, ptsUs, len(data))
+	}
+}
+func (s *h264Source) setAudioReadDeadline(d time.Duration) error {
+	s.audioMu.Lock()
+	c := s.audioConn
+	s.audioMu.Unlock()
+	if c == nil {
+		return nil
+	}
+	return c.SetReadDeadline(time.Now().Add(d))
+}
+func (s *h264Source) clearAudioReadDeadline() error {
+	s.audioMu.Lock()
+	c := s.audioConn
+	s.audioMu.Unlock()
+	if c == nil {
+		return nil
+	}
+	return c.SetReadDeadline(time.Time{})
+}
+
+func (s *h264Source) startAudioWhenReady(pc *webrtc.PeerConnection) {
+	if !s.audioEnabled || pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
+		return
+	}
+	// Audio capture/encoding is started by the daemon as soon as ROLE_AUDIO
+	// is bound. Do not send the legacy 0x16 control byte here: it belongs to
+	// the old on-demand audio-start path and is not part of this daemon flow.
+	s.mu.Lock()
+	s.audioStarted = true
+	s.mu.Unlock()
+	log.Printf("[AUDIO-DIAG] WebRTC peer connected; ROLE_AUDIO stream is already running")
+}
+func (s *h264Source) pipeAudioTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.PeerConnection) {
+	var last uint64
+	for {
+		s.mu.RLock()
+		ch := s.audioChanged
+		latest := s.audioSeq
+		var af *audioFrame
+		if last == 0 && latest > 0 {
+			last = latest - 1
+		}
+		for i := range s.audioHistory {
+			if s.audioHistory[i].seq == last+1 {
+				v := *s.audioHistory[i]
+				af = &v
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if af == nil {
+			if pc.ConnectionState() == webrtc.PeerConnectionStateClosed || pc.ConnectionState() == webrtc.PeerConnectionStateFailed {
+				return
+			}
+			select {
+			case <-ch:
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+		if err := track.WriteSample(media.Sample{Data: af.data, PacketTimestamp: uint32((af.ptsUs * 48) / 1000), Duration: af.duration}); err != nil {
+			log.Printf("[AUDIO-DIAG] WebRTC WriteSample failed: %v", err)
+			return
+		}
+		last = af.seq
+	}
+}
+
 func (s *h264Source) dropSession() {
 	s.sessionMu.Lock()
 	if s.session != nil {
@@ -1181,6 +1748,45 @@ func (s *h264Source) pollCursorURL(url string) {
 	}
 }
 
+func (s *h264Source) openRoleSocket(role int) (net.Conn, error) {
+	s.sessionMu.Lock()
+	sid := s.sessionID
+	ok := s.session != nil
+	s.sessionMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("daemon session not established")
+	}
+	c, err := net.DialTimeout("tcp", s.addr, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	configureTCP(c)
+	if err = writeU8(c, role); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if err = writeI32(c, sid); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if err = writeI32(c, int32(s.displayID)); err != nil {
+		c.Close()
+		return nil, err
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	ack, err := readI32(c)
+	_ = c.SetReadDeadline(time.Time{})
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	if int(ack) != s.displayID {
+		c.Close()
+		return nil, fmt.Errorf("role=%d display ack mismatch got=%d want=%d", role, ack, s.displayID)
+	}
+	return c, nil
+}
+
 // ---- DLNA output (H.264 -> MPEG-TS over HTTP + UPnP AVTransport) ----
 
 type dlnaCastRequest struct {
@@ -1210,6 +1816,98 @@ type upnpDeviceDescription struct {
 			} `xml:"serviceList"`
 		} `xml:"deviceList>device"`
 	} `xml:"device"`
+}
+
+type dlnaDiscoveredDevice struct {
+	IP           string `json:"ip"`
+	Location     string `json:"location,omitempty"`
+	FriendlyName string `json:"friendlyName,omitempty"`
+	ModelName    string `json:"modelName,omitempty"`
+}
+
+func handleDLNADiscover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	devices := discoverDLNADevices(1800 * time.Millisecond)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{"devices": devices})
+}
+
+func discoverDLNADevices(timeout time.Duration) []dlnaDiscoveredDevice {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	msg := "M-SEARCH * HTTP/1.1\r\n" +
+		"HOST: 239.255.255.250:1900\r\n" +
+		"MAN: \"ssdp:discover\"\r\n" +
+		"MX: 1\r\n" +
+		"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+	_, _ = conn.WriteToUDP([]byte(msg), &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900})
+
+	seen := make(map[string]bool)
+	var out []dlnaDiscoveredDevice
+	buf := make([]byte, 8192)
+	for {
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			break
+		}
+		if addr == nil || addr.IP == nil {
+			continue
+		}
+		ip := addr.IP.To4()
+		if ip == nil {
+			continue
+		}
+		ipstr := ip.String()
+		if seen[ipstr] {
+			continue
+		}
+		h := parseHTTPHeaders(buf[:n])
+		loc := strings.TrimSpace(h["location"])
+		if loc == "" {
+			continue
+		}
+		seen[ipstr] = true
+		d := dlnaDiscoveredDevice{IP: ipstr, Location: loc}
+		if name, model := fetchDLNAFriendlyInfo(loc); name != "" || model != "" {
+			d.FriendlyName, d.ModelName = name, model
+		}
+		if d.FriendlyName == "" {
+			d.FriendlyName = d.ModelName
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+type dlnaDeviceInfo struct {
+	Device struct {
+		FriendlyName string `xml:"friendlyName"`
+		ModelName    string `xml:"modelName"`
+	} `xml:"device"`
+}
+
+func fetchDLNAFriendlyInfo(location string) (string, string) {
+	client := &http.Client{Timeout: 1200 * time.Millisecond}
+	resp, err := client.Get(location)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", ""
+	}
+	var info dlnaDeviceInfo
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, 128*1024)).Decode(&info); err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(info.Device.FriendlyName), strings.TrimSpace(info.Device.ModelName)
 }
 
 func handleDLNACast(src *h264Source, w http.ResponseWriter, r *http.Request) {
@@ -1259,208 +1957,6 @@ func handleDLNAStatus(src *h264Source, w http.ResponseWriter, r *http.Request) {
 	st := src.dlnaStatusValue()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(st)
-}
-
-func handleDLNADevices(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET only", http.StatusMethodNotAllowed)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-	defer cancel()
-	devices := discoverDLNADevices(ctx)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"devices": devices})
-}
-
-type dlnaDevice struct {
-	IP          string `json:"ip"`
-	Name        string `json:"name"`
-	Location    string `json:"location"`
-	ServiceType string `json:"serviceType,omitempty"`
-}
-
-func discoverDLNADevices(ctx context.Context) []dlnaDevice {
-	seen := map[string]dlnaDevice{}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, localIP := range localIPv4s() {
-		localIP := localIP
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for _, st := range []string{
-				"urn:schemas-upnp-org:device:MediaRenderer:1",
-				"urn:schemas-upnp-org:service:AVTransport:1",
-				"ssdp:all",
-			} {
-				for _, loc := range ssdpSearchAllFromLocal(ctx, localIP, st) {
-					d, ok := inspectDLNACandidate(loc)
-					if !ok || d.IP == "" || d.ServiceType == "" {
-						continue
-					}
-					mu.Lock()
-					seen[d.IP+"|"+d.Location] = d
-					mu.Unlock()
-				}
-			}
-		}()
-	}
-	wg.Wait()
-	out := make([]dlnaDevice, 0, len(seen))
-	for _, d := range seen {
-		out = append(out, d)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		ni, nj := strings.ToLower(out[i].Name), strings.ToLower(out[j].Name)
-		if ni == nj {
-			return out[i].IP < out[j].IP
-		}
-		return ni < nj
-	})
-	return out
-}
-
-func localIPv4s() []string {
-	var out []string
-	seen := map[string]bool{}
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, a := range addrs {
-			var ip net.IP
-			switch v := a.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			ip = ip.To4()
-			if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
-				continue
-			}
-			v := ip.String()
-			if !seen[v] {
-				seen[v] = true
-				out = append(out, v)
-			}
-		}
-	}
-	return out
-}
-
-func ssdpSearchAllFromLocal(ctx context.Context, localIP, st string) []string {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(localIP).To4(), Port: 0})
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-	msg := "M-SEARCH * HTTP/1.1\r\n" +
-		"HOST: 239.255.255.250:1900\r\n" +
-		"MAN: \"ssdp:discover\"\r\n" +
-		"MX: 1\r\n" +
-		"ST: " + st + "\r\n\r\n"
-	if _, err := conn.WriteToUDP([]byte(msg), &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900}); err != nil {
-		return nil
-	}
-	deadline := time.Now().Add(1500 * time.Millisecond)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	_ = conn.SetReadDeadline(deadline)
-	var out []string
-	buf := make([]byte, 8192)
-	for {
-		n, _, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			break
-		}
-		if loc := strings.TrimSpace(parseHTTPHeaders(buf[:n])["location"]); loc != "" {
-			out = append(out, loc)
-		}
-	}
-	return out
-}
-
-func inspectDLNACandidate(location string) (dlnaDevice, bool) {
-	u, err := url.Parse(strings.TrimSpace(location))
-	if err != nil || u.Hostname() == "" {
-		return dlnaDevice{}, false
-	}
-	client := &http.Client{Timeout: 900 * time.Millisecond, CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 2 {
-			return http.ErrUseLastResponse
-		}
-		return nil
-	}}
-	resp, err := client.Get(location)
-	if err != nil || resp == nil {
-		return dlnaDevice{}, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return dlnaDevice{}, false
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	if err != nil {
-		return dlnaDevice{}, false
-	}
-	name, serviceType := parseDLNACandidateDescription(body)
-	if !strings.Contains(strings.ToLower(serviceType), "avtransport") {
-		if !bytes.Contains(bytes.ToLower(body), []byte("avtransport")) {
-			return dlnaDevice{}, false
-		}
-		serviceType = "AVTransport"
-	}
-	if name == "" {
-		name = u.Hostname()
-	}
-	return dlnaDevice{IP: u.Hostname(), Name: name, Location: location, ServiceType: serviceType}, true
-}
-
-func parseDLNACandidateDescription(body []byte) (string, string) {
-	dec := xml.NewDecoder(bytes.NewReader(body))
-	name := ""
-	serviceType := ""
-	inService := false
-	current := ""
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			break
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			current = strings.ToLower(t.Name.Local)
-			if current == "service" {
-				inService = true
-				serviceType = ""
-			}
-		case xml.CharData:
-			v := strings.TrimSpace(string(t))
-			if v == "" {
-				continue
-			}
-			if current == "friendlyname" && name == "" {
-				name = v
-			}
-			if inService && current == "servicetype" && strings.Contains(strings.ToLower(v), "avtransport") {
-				serviceType = v
-			}
-		case xml.EndElement:
-			if strings.EqualFold(t.Name.Local, "service") {
-				inService = false
-			}
-			current = ""
-		}
-	}
-	return name, serviceType
 }
 
 func (s *h264Source) dlnaStatusValue() dlnaStatus {
@@ -1769,6 +2265,63 @@ func serveDLNADeviceDescription(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, `<?xml version="1.0" encoding="utf-8"?><root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType><friendlyName>VirtualDisplay Gateway</friendlyName><manufacturer>VirtualDisplay</manufacturer><modelName>VirtualDisplay DLNA Server</modelName><UDN>uuid:virtualdisplay-gateway</UDN><serviceList><service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType><serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><controlURL>/dlna/control/content</controlURL><eventSubURL>/dlna/event/content</eventSubURL><SCPDURL>/dlna/scpd/content.xml</SCPDURL></service></serviceList></device></root>`)
 }
 
+func countADTSFrames(data []byte) int {
+	count := 0
+	for i := 0; i < len(data)-7; {
+		if data[i] == 0xFF && (data[i+1]&0xF0) == 0xF0 {
+			frameLen := (int(data[i+3]&0x03) << 11) | (int(data[i+4]) << 3) | (int(data[i+5]) >> 5)
+			if frameLen <= 0 {
+				break
+			}
+			count++
+			i += frameLen
+		} else {
+			i++
+		}
+	}
+	return count
+}
+
+func (s *h264Source) peekVideoFrame(after uint64) *h264Frame {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.history) == 0 {
+		return nil
+	}
+
+	// 当 after == 0 时，遍历历史，寻找【第一个关键帧】（避免因第一个帧是 P 帧而死锁返回 nil）
+	if after == 0 {
+		for _, f := range s.history {
+			if f.flags&flagKeyFrame != 0 {
+				return f
+			}
+		}
+		return nil
+	}
+
+	// 已经锁定关键帧后，按 sequence 递增顺序吐帧
+	for _, f := range s.history {
+		if f.seq > after {
+			return f
+		}
+	}
+	return nil
+}
+
+func (s *h264Source) peekAudioFrame(after uint64) *audioFrame {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, af := range s.audioHistory {
+		if af.seq > after {
+			return af
+		}
+	}
+	return nil
+}
+
+// 5. 核心 HTTP 服务推流逻辑
 func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
@@ -1786,165 +2339,225 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	flusher, _ := w.(http.Flusher)
-	bw := bufio.NewWriterSize(w, dlnaHTTPWriteBuffer)
-	enc := newMPEGTSWriter(bw, uint16(h.Width), uint16(h.Height))
-	enc.writePATPMT()
-	if err := bw.Flush(); err != nil {
+	enc := newMPEGTSWriter(w, uint16(h.Width), uint16(h.Height))
+	if err := enc.writePATPMT(); err != nil {
 		return
 	}
 	flusherSafeFlush(flusher)
 
-	// DLNA is intentionally delayed behind the live edge. The source keeps a
-	// larger frame history, so short renderer/Wi-Fi stalls consume this cushion
-	// instead of immediately hitting the live-source edge.
-	startSeq := s.dlnaBufferedStartSeq(dlnaPlaybackDelay)
-	if startSeq == 0 {
-		for {
+	var lastVideoSeq uint64
+	var lastAudioSeq uint64
+
+	transcoder := NewAudioTranscoder(48000, 2, 96000)
+	if transcoder == nil {
+		log.Printf("[DLNA-AUDIO] FDK AAC transcoder initialization failed")
+	} else {
+		defer transcoder.Close()
+	}
+
+	// IMPORTANT: scrcpy video/audio PTS are not guaranteed to share the same
+	// origin. WebRTC deliberately normalizes video PTS, while ROLE_AUDIO exposes
+	// the source audio clock. Using the two raw PTS values to interleave or to
+	// start the TS program can put AAC hours away from the video timeline.
+	//
+	// Establish one local 90 kHz timeline. Keep the pacing of each source stream,
+	// but align their zero points by the arrival time of the first cached
+	// video/audio frames.
+	var videoBasePtsUs int64 = -1
+	var audioBasePtsUs int64 = -1
+	var audioOffsetUs int64
+	timelineReady := false
+	var lastWrittenVideoPts uint64
+	var lastWrittenAudioPts uint64
+
+	// The audio history is intentionally buffered for WebRTC reconnects. A new
+	// DLNA client must NOT start from the oldest retained Opus packet, otherwise
+	// it can begin several seconds behind the first video keyframe. We seek the
+	// audio cursor to the frame whose receive timestamp is closest to the first
+	// video keyframe instead.	
+	var audioStartReceivedAt time.Time
+
+	for {
+		vf := s.peekVideoFrame(lastVideoSeq)
+		af := s.peekAudioFrame(lastAudioSeq)
+
+		if vf == nil && af == nil {
 			s.mu.RLock()
-			key := s.latestKey
-			ch := s.changed
+			chV := s.changed
+			chA := s.audioChanged
 			s.mu.RUnlock()
-			if key != nil {
-				startSeq = key.seq
-				break
-			}
-			t := time.NewTimer(2 * time.Second)
 			select {
 			case <-r.Context().Done():
-				t.Stop()
 				return
-			case <-ch:
-				if !t.Stop() {
-					select {
-					case <-t.C:
-					default:
+			case <-chV:
+			case <-chA:
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
+		// Do not put audio before the first video keyframe. But once the first
+		// video frame is available, establish both stream bases from the same
+		// cached-history snapshot and retain the audio/video pacing thereafter.
+		if !timelineReady {
+			if vf == nil || vf.flags&flagKeyFrame == 0 {
+				time.Sleep(2 * time.Millisecond)
+				continue
+			}
+
+			// Re-seek audio once, using receive time rather than source PTS. This
+			// removes the accumulated history backlog from the DLNA start point.
+			if audioStartReceivedAt.IsZero() {
+				if vf.receivedAt.IsZero() {
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				s.mu.RLock()
+				var nearest *audioFrame
+				var nearestDelta time.Duration
+				for _, candidate := range s.audioHistory {
+					if candidate.receivedAt.IsZero() {
+						continue
+					}
+					d := candidate.receivedAt.Sub(vf.receivedAt)
+					if d < 0 {
+						d = -d
+					}
+					if nearest == nil || d < nearestDelta {
+						nearest = candidate
+						nearestDelta = d
 					}
 				}
-			case <-t.C:
-			}
-		}
-	}
+				s.mu.RUnlock()
 
-	var lastSeq uint64
-	var lastSourceAt time.Time
-	lastFlush := time.Now()
-	for {
-		frame, ok := s.nextFrameAfter(startSeq-1, 2*time.Second)
-		if !ok || frame == nil {
-			if r.Context().Err() != nil {
-				_ = bw.Flush()
-				return
+				if nearest == nil {
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				// peekAudioFrame(after) returns seq > after, so seq-1 makes
+				// 'nearest' the first audio frame emitted by this client.
+				if nearest.seq > 0 {
+					lastAudioSeq = nearest.seq - 1
+				}
+				audioStartReceivedAt = nearest.receivedAt
+				log.Printf("[DLNA-AUDIO] start seek videoRecv=%s audioRecv=%s backlog=%s audioSeq=%d",
+					vf.receivedAt.Format(time.RFC3339Nano), nearest.receivedAt.Format(time.RFC3339Nano),
+					nearest.receivedAt.Sub(vf.receivedAt), nearest.seq)
 			}
-			if seq := s.dlnaBufferedStartSeq(dlnaPlaybackDelay); seq != 0 {
-				startSeq = seq
-				lastSeq = 0
+
+			af = s.peekAudioFrame(lastAudioSeq)
+			if af == nil {
+				time.Sleep(2 * time.Millisecond)
 				continue
 			}
-			continue
-		}
-		startSeq = frame.seq + 1
 
-		// Keep real-time cadence while staying several seconds behind the live edge.
-		// The first cached keyframe starts immediately; following frames are paced by
-		// the original source arrival intervals so the initial cache is not burst-sent.
-		if !lastSourceAt.IsZero() {
-			delta := frame.receivedAt.Sub(lastSourceAt)
-			if delta < 0 {
-				delta = 0
+			videoBasePtsUs = vf.ptsUs
+			audioBasePtsUs = af.ptsUs
+			// Fine-tune the local audio clock from receive-time skew. Positive
+			// skew means the audio packet arrived later and therefore needs to
+			// start slightly earlier on the common timeline, not later.
+			if !vf.receivedAt.IsZero() && !af.receivedAt.IsZero() {
+				audioOffsetUs = -af.receivedAt.Sub(vf.receivedAt).Microseconds()
 			}
-			if delta > 500*time.Millisecond {
-				delta = 500 * time.Millisecond
+			if audioOffsetUs < -500_000 || audioOffsetUs > 500_000 {
+				audioOffsetUs = 0
 			}
-			if delta > 0 {
-				t := time.NewTimer(delta)
-				select {
-				case <-r.Context().Done():
-					t.Stop()
-					_ = bw.Flush()
-					return
-				case <-t.C:
+			timelineReady = true
+			log.Printf("[DLNA-AUDIO] timeline aligned videoPTS=%d audioPTS=%d audioOffset=%dus",
+				videoBasePtsUs, audioBasePtsUs, audioOffsetUs)
+		}
+
+		writeVideo := false
+		writeAudio := false
+		var vLocalUs, aLocalUs int64
+
+		if vf != nil {
+			vLocalUs = vf.ptsUs - videoBasePtsUs
+			if vLocalUs < 0 {
+				vLocalUs = 0
+			}
+		}
+		if af != nil {
+			aLocalUs = af.ptsUs - audioBasePtsUs + audioOffsetUs
+			if aLocalUs < 0 {
+				aLocalUs = 0
+			}
+		}
+
+		if vf != nil && af != nil {
+			if vLocalUs <= aLocalUs {
+				writeVideo = true
+			} else {
+				writeAudio = true
+			}
+		} else if vf != nil {
+			writeVideo = true
+		} else if af != nil {
+			writeAudio = true
+		}
+
+		if writeVideo {
+			data := vf.data
+			if vf.flags&flagKeyFrame != 0 {
+				_ = enc.writePATPMT()
+				if !containsSPSPPS(data) {
+					s.mu.RLock()
+					cfg := append([]byte(nil), s.config...)
+					s.mu.RUnlock()
+					if len(cfg) > 0 {
+						data = append(cfg, data...)
+					}
 				}
 			}
-		}
-		lastSourceAt = frame.receivedAt
-
-		data := frame.data
-		if frame.flags&flagKeyFrame != 0 && !containsSPSPPS(data) {
-			s.mu.RLock()
-			cfg := append([]byte(nil), s.config...)
-			s.mu.RUnlock()
-			if len(cfg) > 0 {
-				data = append(cfg, data...)
+			pts90k := uint64(vLocalUs) * 90 / 1000
+			// Guard against accidental backward PTS after a source reconnect.
+			if pts90k < lastWrittenVideoPts {
+				pts90k = lastWrittenVideoPts
 			}
-		}
-		if lastSeq != 0 && frame.seq != lastSeq+1 && frame.flags&flagKeyFrame == 0 {
-			if seq := s.dlnaBufferedStartSeq(dlnaPlaybackDelay); seq != 0 {
-				startSeq = seq
-				lastSeq = 0
-				continue
-			}
-			continue
-		}
-		pts90k := uint64(max64(0, frame.ptsUs)) * 90 / 1000
-		if err := enc.writeH264AccessUnit(data, pts90k); err != nil {
-			_ = bw.Flush()
-			return
-		}
-		lastSeq = frame.seq
-		if time.Since(lastFlush) >= dlnaFlushInterval {
-			if err := bw.Flush(); err != nil {
+			if err := enc.writeH264AccessUnit(data, pts90k); err != nil {
 				return
 			}
-			flusherSafeFlush(flusher)
-			lastFlush = time.Now()
-		}
-	}
-}
-
-func (s *h264Source) dlnaBufferedStartSeq(delay time.Duration) uint64 {
-	cutoff := time.Now().Add(-delay)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for i := len(s.history) - 1; i >= 0; i-- {
-		f := s.history[i]
-		if f.receivedAt.After(cutoff) {
-			continue
-		}
-		if f.flags&flagKeyFrame != 0 {
-			return f.seq
-		}
-	}
-	return 0
-}
-
-func (s *h264Source) nextFrameAfter(after uint64, timeout time.Duration) (*h264Frame, bool) {
-	deadline := time.Now().Add(timeout)
-	for {
-		s.mu.RLock()
-		i := sort.Search(len(s.history), func(i int) bool { return s.history[i].seq > after })
-		if i < len(s.history) {
-			f := s.history[i]
-			s.mu.RUnlock()
-			return f, true
-		}
-		ch := s.changed
-		s.mu.RUnlock()
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return nil, false
-		}
-		t := time.NewTimer(minDuration(remain, 500*time.Millisecond))
-		select {
-		case <-ch:
-			if !t.Stop() {
-				select {
-				case <-t.C:
-				default:
-				}
+			lastWrittenVideoPts = pts90k
+			lastVideoSeq = vf.seq
+		} else if writeAudio {
+			var aacData []byte
+			if transcoder != nil {
+				aacData = transcoder.Transcode(af.data)
 			}
-		case <-t.C:
-			return nil, false
+			if len(aacData) == 0 {
+				lastAudioSeq = af.seq
+				flusherSafeFlush(flusher)
+				continue
+			}
+
+			adtsFrames := countADTSFrames(aacData)
+			if adtsFrames <= 0 {
+				log.Printf("[DLNA-AUDIO] encoder returned non-ADTS data size=%d first=%s",
+					len(aacData), firstBytes(aacData, 16))
+				lastAudioSeq = af.seq
+				flusherSafeFlush(flusher)
+				continue
+			}
+
+			pts90k := uint64(aLocalUs) * 90 / 1000
+			if pts90k < lastWrittenAudioPts {
+				pts90k = lastWrittenAudioPts
+			}
+			if err := enc.writeAACFrame(aacData, pts90k); err != nil {
+				return
+			}
+			// AAC-LC/ADTS uses 1024 samples per AAC frame. At 48 kHz:
+			// 1024 / 48000 * 90000 = 1920 ticks.
+			lastWrittenAudioPts = pts90k + uint64(adtsFrames)*1920
+
+			if s.audioFrames <= 10 || s.audioFrames%250 == 0 {
+				log.Printf("[DLNA-AUDIO] AAC output: opusSeq=%d adtsFrames=%d bytes=%d pts90k=%d",
+					af.seq, adtsFrames, len(aacData), pts90k)
+			}
+			lastAudioSeq = af.seq
 		}
+
+		flusherSafeFlush(flusher)
 	}
 }
 
@@ -1982,74 +2595,102 @@ func (s *h264Source) nextFrame(after uint64, timeout time.Duration) (*h264Frame,
 }
 
 type mpegTSWriter struct {
-	w  io.Writer
-	cc uint8
+	w       io.Writer
+	ccVideo uint8
+	ccAudio uint8
 }
 
 func newMPEGTSWriter(w io.Writer, _, _ uint16) *mpegTSWriter {
 	return &mpegTSWriter{w: w}
 }
 
-func (m *mpegTSWriter) writePATPMT() {
+func (m *mpegTSWriter) writePATPMT() error {
 	pat := buildPATPacket()
+	if _, err := m.w.Write(pat[:]); err != nil {
+		return err
+	}
 	pmt := buildPMTPacket()
-	_, _ = m.w.Write(pat[:])
-	_, _ = m.w.Write(pmt[:])
+	if _, err := m.w.Write(pmt[:]); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (m *mpegTSWriter) writeH264AccessUnit(annexBData []byte, pts90k uint64) error {
-	pes := buildPES(annexBData, pts90k)
-	return m.writePES(pes, true, pts90k)
+	pes := buildPES(0xe0, annexBData, pts90k)
+	return m.writePES(tsPIDVideo, pes, true, pts90k)
 }
 
-func (m *mpegTSWriter) writePES(pes []byte, randomAccess bool, pts90k uint64) error {
+func (m *mpegTSWriter) writeOpusFrame(opusData []byte, pts90k uint64) error {
+	pes := buildPES(0xc0, opusData, pts90k)
+	return m.writePES(tsPIDAudio, pes, false, pts90k)
+}
+
+func (m *mpegTSWriter) writeAACFrame(aacData []byte, pts90k uint64) error {
+	pes := buildPES(0xc0, aacData, pts90k) // 0xc0 为 MPEG Audio 标志
+	return m.writePES(tsPIDAudio, pes, false, pts90k)
+}
+
+func (m *mpegTSWriter) writePES(pid uint16, pes []byte, randomAccess bool, pts90k uint64) error {
+	var cc *uint8
+	if pid == tsPIDAudio {
+		cc = &m.ccAudio
+	} else {
+		cc = &m.ccVideo
+	}
+
 	first := true
 	for len(pes) > 0 {
 		var pkt [188]byte
 		pkt[0] = 0x47
-		pid := tsPIDVideo
 		pkt[1] = byte((pid >> 8) & 0x1f)
 		pkt[2] = byte(pid)
 
-		payloadCapacity := 184
-		adaptationLen := -1
-		if first {
-			// Put PCR on the PES start packet. This is important for live renderers
-			// which use the transport-stream clock rather than only PTS.
+		includePCR := first && (pid == tsPIDVideo)
+		var payloadCapacity int
+		var adaptationLen int
+
+		// 核心修复：精准计算每个包的实际 Payload 容量与 Adaptation 填充长度
+		if includePCR {
 			payloadCapacity = 176
 			if len(pes) < payloadCapacity {
 				payloadCapacity = len(pes)
 			}
 			adaptationLen = 183 - payloadCapacity
 			if adaptationLen < 7 {
-				payloadCapacity = 176
 				adaptationLen = 7
 			}
-		}
-		if !first && len(pes) < payloadCapacity {
-			adaptationLen = 183 - len(pes)
-			payloadCapacity = len(pes)
+		} else {
+			if len(pes) < 184 {
+				payloadCapacity = len(pes) // 修复点：必须更新 payloadCapacity 为剩余字节数
+				adaptationLen = 183 - payloadCapacity
+			} else {
+				payloadCapacity = 184
+				adaptationLen = -1
+			}
 		}
 
 		payloadStart := 4
 		if first {
-			pkt[1] |= 0x40
+			pkt[1] |= 0x40 // payload_unit_start_indicator
 		}
+
 		if adaptationLen >= 0 {
-			pkt[3] = 0x30 | (m.cc & 0x0f)
-			m.cc++
+			pkt[3] = 0x30 | (*cc & 0x0f)
+			*cc = (*cc + 1) & 0x0f
 			pkt[4] = byte(adaptationLen)
+
 			if adaptationLen > 0 {
 				flags := byte(0)
 				if first && randomAccess {
-					flags |= 0x40
+					flags |= 0x40 // random_access_indicator
 				}
-				if first {
-					flags |= 0x10 // PCR present
+				if includePCR {
+					flags |= 0x10 // PCR_flag
 				}
 				pkt[5] = flags
 				pos := 6
-				if first {
+				if includePCR {
 					writePCR(pkt[pos:pos+6], pts90k)
 					pos += 6
 				}
@@ -2060,13 +2701,16 @@ func (m *mpegTSWriter) writePES(pes []byte, randomAccess bool, pts90k uint64) er
 			}
 			payloadStart = 5 + adaptationLen
 		} else {
-			pkt[3] = 0x10 | (m.cc & 0x0f)
-			m.cc++
+			pkt[3] = 0x10 | (*cc & 0x0f)
+			*cc = (*cc + 1) & 0x0f
 		}
+
+		// 安全安全复制数据，不再引发 Panic
 		copy(pkt[payloadStart:], pes[:payloadCapacity])
-		for i := payloadStart + payloadCapacity; i < len(pkt); i++ {
+		for i := payloadStart + payloadCapacity; i < 188; i++ {
 			pkt[i] = 0xff
 		}
+
 		if _, err := m.w.Write(pkt[:]); err != nil {
 			return err
 		}
@@ -2076,9 +2720,9 @@ func (m *mpegTSWriter) writePES(pes []byte, randomAccess bool, pts90k uint64) er
 	return nil
 }
 
-func buildPES(payload []byte, pts90k uint64) []byte {
+func buildPES(streamID byte, payload []byte, pts90k uint64) []byte {
 	pes := make([]byte, 14+len(payload))
-	copy(pes[0:4], []byte{0, 0, 1, 0xe0})
+	copy(pes[0:4], []byte{0, 0, 1, streamID})
 	packetLen := len(payload) + 8
 	if packetLen > 0xffff {
 		packetLen = 0
@@ -2112,13 +2756,22 @@ func writePCR(dst []byte, pts90k uint64) {
 	dst[5] = byte(ext)
 }
 
+// 构建 PAT (Program Association Table)
 func buildPATPacket() [188]byte {
 	var p [188]byte
-	p[0], p[1], p[2], p[3], p[4] = 0x47, 0x40, 0x00, 0x10, 0x00
-	section := []byte{0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00, 0x00, 0x01, 0xe0, 0x00}
+	p[0] = 0x47
+	p[1] = 0x40
+	p[2] = 0x00
+	p[3] = 0x10
+	p[4] = 0x00
+
+	section := []byte{
+		0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00,
+		0x00, 0x01, byte((tsPIDPMT>>8)&0x1f) | 0xe0, byte(tsPIDPMT & 0xff),
+	}
 	copy(p[5:], section)
-	binary.BigEndian.PutUint32(p[17:21], mpegCRC32(section))
-	for i := 21; i < len(p); i++ {
+	binary.BigEndian.PutUint32(p[5+len(section):5+len(section)+4], mpegCRC32(section))
+	for i := 5 + len(section) + 4; i < len(p); i++ {
 		p[i] = 0xff
 	}
 	return p
@@ -2131,28 +2784,33 @@ func buildPMTPacket() [188]byte {
 	p[2] = byte(tsPIDPMT & 0xff)
 	p[3] = 0x10
 	p[4] = 0x00
+
+	// Section length 改为 0x17 (23 bytes)
 	section := []byte{
-		0x02, 0xb0, 0x12, 0x00, 0x01, 0xc1, 0x00, 0x00,
+		0x02, 0xb0, 0x17, 0x00, 0x01, 0xc1, 0x00, 0x00,
 		0xe1, 0x00, 0xf0, 0x00,
-		0x1b, 0xe0 | byte((tsPIDVideo>>8)&0x1f), byte(tsPIDVideo & 0xff), 0xf0, 0x00,
+		// Video ES (H.264, PID 0x0100)
+		0x1b, byte(0xe0 | ((tsPIDVideo >> 8) & 0x1f)), byte(tsPIDVideo & 0xff), 0xf0, 0x00,
+		// Audio ES (修改为 ADTS AAC 0x0f, PID 0x0101)
+		0x0f, byte(0xe0 | ((tsPIDAudio >> 8) & 0x1f)), byte(tsPIDAudio & 0xff), 0xf0, 0x00,
 	}
 	copy(p[5:], section)
-	binary.BigEndian.PutUint32(p[22:26], mpegCRC32(section))
-	for i := 26; i < len(p); i++ {
+	binary.BigEndian.PutUint32(p[5+len(section):5+len(section)+4], mpegCRC32(section))
+	for i := 5 + len(section) + 4; i < len(p); i++ {
 		p[i] = 0xff
 	}
 	return p
 }
 
-func mpegCRC32(b []byte) uint32 {
+func mpegCRC32(data []byte) uint32 {
 	crc := uint32(0xffffffff)
-	for _, c := range b {
-		crc ^= uint32(c) << 24
-		for i := 0; i < 8; i++ {
-			if crc&0x80000000 != 0 {
-				crc = (crc << 1) ^ 0x04c11db7
-			} else {
-				crc <<= 1
+	for _, b := range data {
+		for i := 7; i >= 0; i-- {
+			bit := (b >> i) & 1
+			c15 := (crc >> 31) & 1
+			crc <<= 1
+			if c15^uint32(bit) != 0 {
+				crc ^= 0x04c11db7
 			}
 		}
 	}
