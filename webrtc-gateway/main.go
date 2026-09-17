@@ -286,14 +286,13 @@ body{display:flex;flex-direction:column}
 button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:5px 10px;cursor:pointer}
 #wrap{position:relative;flex:1;min-height:0;overflow:hidden;background:#000}
 #video{position:absolute;left:50%;top:50%;display:block;background:#000;object-fit:fill;transform:translate(-50%,-50%);transform-origin:center center}
-#cursor{position:absolute;width:0;height:0;pointer-events:none;z-index:20;display:none;filter:drop-shadow(0 1px 1px rgba(0,0,0,.9))}
-#cursor::before{content:"";position:absolute;left:0;top:0;width:0;height:0;border-top:15px solid #fff;border-right:8px solid transparent;transform:rotate(-8deg)}
-#cursor::after{content:"";position:absolute;left:2px;top:3px;width:0;height:0;border-top:10px solid #111;border-right:5px solid transparent;transform:rotate(-8deg)}
+#cursor{position:absolute;left:0;top:0;width:20px;height:24px;pointer-events:none;z-index:20;display:none;transform:translate3d(0,0,0);will-change:transform;filter:drop-shadow(0 1px 2px rgba(0,0,0,.28))}
+#cursor svg{display:block;width:20px;height:24px;overflow:visible}
 </style>
 </head>
 <body>
 <div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><label><input id="audioEnabled" type="checkbox" checked>音频</label><button id="soundBtn">🔊声音</button><audio id="audioOut" autoplay playsinline></audio><button id="reconnect">Reconnect</button><button id="fullscreenBtn">全屏</button><a href="/dlna" style="color:#9ad;text-decoration:none">DLNA投屏</a></div>
-<div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"></div></div>
+<div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"><svg viewBox="0 0 20 24" aria-hidden="true"><path d="M2.2 1.5 17.8 16.1 12.3 16.6 16.3 22.3 13.6 23.6 9.7 17.9 5.1 21.1Z" fill="#ffffff" stroke="#111111" stroke-width="0.65" stroke-linejoin="round" stroke-linecap="round"/></svg></div></div>
 <script>
 const video=document.getElementById('video');
 const wrap=document.getElementById('wrap');
@@ -357,21 +356,54 @@ function applyVideoLayout(){
   }
 }
 
-function updateCursor(c){
-  if(!c || !c.visible || !c.width || !c.height || !video.videoWidth || !video.videoHeight){
-    cursor.style.display='none'; return;
+let cursorTarget=null;
+let cursorRender=null;
+let cursorRenderRAF=0;
+let cursorLastRenderTime=0;
+function setCursorSample(c){
+  if(!c || !c.visible || !c.width || !c.height){
+    cursorTarget=null;
+    cursorRender=null;
+    cursor.style.display='none';
+    return;
+  }
+  cursorTarget={x:c.x,y:c.y,width:c.width,height:c.height,visible:true};
+  if(!cursorRender) cursorRender={x:c.x,y:c.y};
+  if(!cursorRenderRAF) cursorRenderRAF=requestAnimationFrame(renderCursor);
+}
+function renderCursor(now){
+  cursorRenderRAF=0;
+  if(!cursorTarget || !cursorTarget.visible || !video.videoWidth || !video.videoHeight){
+    cursor.style.display='none';
+    return;
   }
   const vr=video.getBoundingClientRect(), wr=wrap.getBoundingClientRect();
   if(vr.width<=0||vr.height<=0){cursor.style.display='none';return;}
-  let nx=c.x/c.width, ny=c.y/c.height;
+  if(!cursorLastRenderTime) cursorLastRenderTime=now;
+  const dt=Math.min(32,Math.max(1,now-cursorLastRenderTime));
+  cursorLastRenderTime=now;
+  // Critically damped-style follow: converge to the latest real sample without prediction.
+  // This removes the previous overshoot/jitter while keeping motion visually smooth.
+  const alpha=1-Math.exp(-dt/22);
+  cursorRender.x += (cursorTarget.x-cursorRender.x)*alpha;
+  cursorRender.y += (cursorTarget.y-cursorRender.y)*alpha;
+  let x=Math.max(0,Math.min(cursorTarget.width-1,cursorRender.x));
+  let y=Math.max(0,Math.min(cursorTarget.height-1,cursorRender.y));
+  let nx=x/cursorTarget.width, ny=y/cursorTarget.height;
   if(rotated){
     const tx=nx, ty=ny;
     nx=1-ty; ny=tx;
   }
-  cursor.style.left=(vr.left-wr.left+nx*vr.width)+'px';
-  cursor.style.top=(vr.top-wr.top+ny*vr.height)+'px';
+  const px=vr.left-wr.left+nx*vr.width;
+  const py=vr.top-wr.top+ny*vr.height;
+  cursor.style.transform='translate3d('+Math.round(px*10)/10+'px,'+Math.round(py*10)/10+'px,0)';
   cursor.style.display='block';
+  // Keep rendering while moving toward the latest sample; stop once essentially settled.
+  if(Math.abs(cursorTarget.x-cursorRender.x)>0.15 || Math.abs(cursorTarget.y-cursorRender.y)>0.15){
+    cursorRenderRAF=requestAnimationFrame(renderCursor);
+  }
 }
+function updateCursor(c){ setCursorSample(c); }
 
 async function refreshStatus(){
   try{
@@ -386,10 +418,19 @@ async function refreshStatus(){
   }catch(e){}
 }
 
+let cursorPollBusy=false;
+let cursorPollTimer=0;
 async function pollCursor(){
-  try{const r=await fetch('/cursor',{cache:'no-store'});if(r.ok)updateCursor(await r.json());}
-  catch(e){}
-  requestAnimationFrame(()=>setTimeout(pollCursor,33));
+  if(cursorPollBusy){ cursorPollTimer=setTimeout(pollCursor,20); return; }
+  cursorPollBusy=true;
+  try{
+    const r=await fetch('/cursor',{cache:'no-store'});
+    if(r.ok) updateCursor(await r.json());
+  }catch(e){}
+  finally{
+    cursorPollBusy=false;
+    cursorPollTimer=setTimeout(pollCursor,20);
+  }
 }
 
 async function enterFullscreen(){
