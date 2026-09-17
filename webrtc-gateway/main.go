@@ -9,6 +9,8 @@ import (
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"log"
 	"net"
@@ -19,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pion/interceptor"
@@ -231,6 +234,7 @@ const (
 	roleAudio       = 1
 	roleControl     = 2
 	roleNegotiation = 3
+	roleInternalSHM = 3 // negotiation-only role declaration; not a TCP role socket
 
 	// Current daemon protocol message.
 	typeConfigureSession = 216
@@ -246,6 +250,12 @@ const (
 	packetFlagSession  uint32 = 1 << 31
 	packetFlagConfig   uint64 = 1 << 62
 	packetFlagKeyFrame uint64 = 1 << 61
+
+	shmRingFlagHeader uint32 = 1
+	shmRingFlagMeta   uint32 = 1 << 1
+	shmRingFlagPacket uint32 = 1 << 2
+	shmRingFlagConfig uint32 = 1 << 3
+	shmRingFlagKey    uint32 = 1 << 4
 
 	flagConfig   = 1 << 0
 	flagKeyFrame = 1 << 1
@@ -268,6 +278,13 @@ const (
 	tsPIDAudio uint16 = 0x0101
 	tsPIDPMT   uint16 = 0x1000
 	tsPCRBase  uint64 = 90000
+
+	rawFrameDefaultAddr            = "127.0.0.1:27184"
+	rawFrameMagic           uint32 = 0x56445257 // VDRW
+	rawFrameProtocolVersion uint32 = 1
+	rawFrameRawMagic        uint32 = 0x4652414d // FRAM
+	rawFrameTileMagic       uint32 = 0x54494c45 // TILE
+	rawFrameTileSize               = 256
 )
 
 const browserHTML = `<!doctype html>
@@ -285,14 +302,14 @@ body{display:flex;flex-direction:column}
 #status{color:#9ad}
 button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:5px 10px;cursor:pointer}
 #wrap{position:relative;flex:1;min-height:0;overflow:hidden;background:#000}
-#video{position:absolute;left:50%;top:50%;display:block;background:#000;object-fit:fill;transform:translate(-50%,-50%);transform-origin:center center}
+#video{position:absolute;left:50%;top:50%;display:block;background:#000;object-fit:fill;transform:translate(-50%,-50%);transform-origin:center center}#tileCanvas{position:absolute;left:0;top:0;width:100%;height:100%;display:none;background:#000}
 #cursor{position:absolute;left:0;top:0;width:20px;height:24px;pointer-events:none;z-index:20;display:none;transform:translate3d(0,0,0);will-change:transform;filter:drop-shadow(0 1px 2px rgba(0,0,0,.28))}
 #cursor svg{display:block;width:20px;height:24px;overflow:visible}
 </style>
 </head>
 <body>
 <div id="bar"><span>VirtualDisplay WebRTC</span><span id="status">connecting...</span><label><input id="audioEnabled" type="checkbox" checked>音频</label><button id="soundBtn">🔊声音</button><audio id="audioOut" autoplay playsinline></audio><button id="reconnect">Reconnect</button><button id="fullscreenBtn">全屏</button><a href="/dlna" style="color:#9ad;text-decoration:none">DLNA投屏</a></div>
-<div id="wrap"><video id="video" autoplay playsinline muted></video><div id="cursor"><svg viewBox="0 0 20 24" aria-hidden="true"><path d="M2.2 1.5 17.8 16.1 12.3 16.6 16.3 22.3 13.6 23.6 9.7 17.9 5.1 21.1Z" fill="#ffffff" stroke="#111111" stroke-width="0.65" stroke-linejoin="round" stroke-linecap="round"/></svg></div></div>
+<div id="wrap"><video id="video" autoplay playsinline muted></video><canvas id="tileCanvas"></canvas><canvas id="tileScratch" style="display:none"></canvas><div id="cursor"><svg viewBox="0 0 20 24" aria-hidden="true"><path d="M2.2 1.5 17.8 16.1 12.3 16.6 16.3 22.3 13.6 23.6 9.7 17.9 5.1 21.1Z" fill="#ffffff" stroke="#111111" stroke-width="0.65" stroke-linejoin="round" stroke-linecap="round"/></svg></div></div>
 <script>
 const video=document.getElementById('video');
 const wrap=document.getElementById('wrap');
@@ -303,6 +320,13 @@ const audioEnabled=document.getElementById('audioEnabled');
 const soundBtn=document.getElementById('soundBtn');
 const audioOut=document.getElementById('audioOut');
 const fullscreenBtn=document.getElementById('fullscreenBtn');
+const tileCanvas=document.getElementById('tileCanvas');
+const tileCtx=tileCanvas.getContext('2d',{alpha:false,desynchronized:true});
+const tileScratch=document.getElementById('tileScratch');
+const tileScratchCtx=tileScratch.getContext('2d',{alpha:false,desynchronized:true});
+let tileChannel=null;
+let tilePending=false;
+let tileMode=false;
 let pc=null;
 let expectedW=0, expectedH=0;
 let sourceW=0, sourceH=0;
@@ -349,10 +373,20 @@ function applyVideoLayout(){
     video.style.width=r.h+'px';
     video.style.height=r.w+'px';
     video.style.transform='translate(-50%,-50%) rotate(90deg)';
+    tileCanvas.style.left='50%';
+    tileCanvas.style.top='50%';
+    tileCanvas.style.width=r.h+'px';
+    tileCanvas.style.height=r.w+'px';
+    tileCanvas.style.transform='translate(-50%,-50%) rotate(90deg)';
   }else{
     video.style.width=r.w+'px';
     video.style.height=r.h+'px';
     video.style.transform='translate(-50%,-50%)';
+    tileCanvas.style.left='50%';
+    tileCanvas.style.top='50%';
+    tileCanvas.style.width=r.w+'px';
+    tileCanvas.style.height=r.h+'px';
+    tileCanvas.style.transform='translate(-50%,-50%)';
   }
 }
 
@@ -404,6 +438,84 @@ function renderCursor(now){
   }
 }
 function updateCursor(c){ setCursorSample(c); }
+
+function resizeTileCanvas(){
+  const w=video.videoWidth||expectedW||sourceW;
+  const h=video.videoHeight||expectedH||sourceH;
+  if(w>0&&h>0){
+    if(tileCanvas.width!==w||tileCanvas.height!==h){ tileCanvas.width=w; tileCanvas.height=h; }
+    if(tileScratch.width!==w||tileScratch.height!==h){ tileScratch.width=w; tileScratch.height=h; }
+  }
+}
+function scrollTileCanvas(dy){
+  if(!tileCtx || !tileScratchCtx) return;
+  resizeTileCanvas();
+  if(tileCanvas.width<=0||tileCanvas.height<=0) return;
+  tileScratchCtx.clearRect(0,0,tileScratch.width,tileScratch.height);
+  tileScratchCtx.drawImage(tileCanvas,0,0);
+  tileCtx.clearRect(0,0,tileCanvas.width,tileCanvas.height);
+  tileCtx.drawImage(tileScratch,0,dy);
+}
+function setTileDisplayMode(mode){
+  if(mode==='tile-pending'){
+    tilePending=true;
+    return;
+  }
+  if(mode==='tile'){
+    tileMode=true; tilePending=false;
+    tileCanvas.style.display='block'; video.style.visibility='hidden';
+    // drawBaseFromVideo() has just copied the current decoded frame. ACK that
+    // exact frame so Go can safely begin applying ordered scroll deltas.
+    if(tileChannel && tileChannel.readyState==='open'){
+      try{ tileChannel.send(JSON.stringify({type:'base-ready'})); }catch(e){}
+    }
+  }else{
+    tileMode=false; tilePending=false;
+    tileCanvas.style.display='none'; video.style.visibility='visible';
+  }
+  applyVideoLayout();
+}
+function drawBaseFromVideo(){
+  // Avoid copying a 1920x1080 frame on every callback. It is only needed while
+  // a pending tile-mode transition is waiting for its H264 base frame.
+  if(!tileCtx || !video.videoWidth || !video.videoHeight || !tilePending || tileMode) return;
+  resizeTileCanvas();
+  tileCtx.drawImage(video,0,0,tileCanvas.width,tileCanvas.height);
+  setTileDisplayMode('tile');
+}
+function handleTileMessage(data){
+  if(typeof data==='string'){
+    try{
+      const x=JSON.parse(data);
+      if(x.type==='mode') setTileDisplayMode(x.mode);
+      else if(x.type==='scroll') scrollTileCanvas(Number(x.dy)||0);
+    }catch(e){}
+    return;
+  }
+  const b=data instanceof ArrayBuffer ? data : data?.buffer;
+  if(!b || b.byteLength<24) return;
+  const dv=new DataView(b);
+  if(dv.getUint32(0,false)!==0x54494c45) return;
+  const x=dv.getUint16(8,false), y=dv.getUint16(10,false), w=dv.getUint16(12,false), h=dv.getUint16(14,false);
+  const len=dv.getUint32(16,false);
+  if(24+len>b.byteLength || w===0 || h===0) return;
+  const blob=new Blob([b.slice(24,24+len)],{type:'image/jpeg'});
+  createImageBitmap(blob).then(img=>{
+    resizeTileCanvas();
+    tileCtx.drawImage(img,x,y,w,h);
+    img.close();
+    if(!tileMode){ tilePending=true; setTileDisplayMode('tile'); }
+  }).catch(()=>{});
+}
+function setupTileChannel(){
+  try{
+    tileChannel=pc.createDataChannel('tile-delta',{ordered:true});
+    tileChannel.binaryType='arraybuffer';
+    tileChannel.onmessage=e=>handleTileMessage(e.data);
+    tileChannel.onopen=()=>console.log('[TILE] DataChannel open');
+    tileChannel.onclose=()=>{tileChannel=null;setTileDisplayMode('full');};
+  }catch(e){ console.warn('[TILE] channel unavailable',e); }
+}
 
 async function refreshStatus(){
   try{
@@ -467,6 +579,7 @@ async function start(auto=false){
     if(pc){try{pc.close()}catch(e){}pc=null;}
     setStatus('creating peer...');
     pc=new RTCPeerConnection({iceServers:[]});
+    setupTileChannel();
     const audioOn=audioEnabled.checked;
     pc.addTransceiver('video',{direction:'recvonly'});
     if(audioOn) pc.addTransceiver('audio',{direction:'recvonly'});
@@ -482,8 +595,13 @@ async function start(auto=false){
     };
     video.onloadedmetadata=()=>{
       sourceW=video.videoWidth; sourceH=video.videoHeight;
+      resizeTileCanvas();
       applyVideoLayout();
     };
+    if('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+      const onVideoFrame=()=>{ drawBaseFromVideo(); video.requestVideoFrameCallback(onVideoFrame); };
+      video.requestVideoFrameCallback(onVideoFrame);
+    }else{ video.addEventListener('timeupdate',drawBaseFromVideo); }
     pc.oniceconnectionstatechange=()=>{
       const st=pc?pc.iceConnectionState:'closed';
       setStatus('ICE: '+st);
@@ -664,6 +782,9 @@ type h264Source struct {
 	videoMu   sync.Mutex
 	videoConn net.Conn
 
+	shmMu sync.RWMutex
+	shm   *shmTransport
+
 	// Diagnostics / stream state.
 	connected        bool
 	connectCount     uint64
@@ -705,6 +826,21 @@ type h264Source struct {
 	dlnaCancel   context.CancelFunc
 	dlnaTargetIP string
 	dlnaURL      string
+
+	// Raw-frame tile delta side channel. This is intentionally independent of
+	// the H264/DLNA paths: Android scrcpy supplies composed RGBA frames locally,
+	// the gateway compares 256x256 tiles, and only small JPEG deltas are sent
+	// over a WebRTC DataChannel while the video track falls back to H264 when a
+	// large portion of the screen changes.
+	tileMu       sync.RWMutex
+	rawStartOnce sync.Once
+	tilePeers    map[*webrtc.DataChannel]struct{}
+	tileMode     bool
+	tileReady    bool
+	tileLowCount int
+	rawWidth     int
+	rawHeight    int
+	rawLastError string
 }
 
 func main() {
@@ -983,6 +1119,16 @@ func handleOffer(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Label() != "tile-delta" {
+			return
+		}
+		src.addTilePeer(dc)
+		dc.OnClose(func() { src.removeTilePeer(dc) })
+		dc.OnError(func(err error) { log.Printf("[TILE] DataChannel error: %v", err) })
+		log.Printf("[TILE] DataChannel attached label=%s", dc.Label())
+	})
+
 	track, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: fmtp},
 		"video", "virtualdisplay")
@@ -1133,6 +1279,7 @@ func newH264Source(addr, token string, displayID, expectedWidth, expectedHeight 
 		audioEnabled:   true,
 		audioChanged:   make(chan struct{}),
 		audioCodecID:   audioCodecOpusID,
+		tilePeers:      make(map[*webrtc.DataChannel]struct{}),
 	}
 }
 
@@ -1152,6 +1299,23 @@ func (s *h264Source) run() {
 func (s *h264Source) readOnce() error {
 	if err := s.ensureSession(); err != nil {
 		return err
+	}
+
+	s.shmMu.RLock()
+	shm := s.shm
+	s.shmMu.RUnlock()
+	if shm != nil && shm.video != nil {
+		s.mu.Lock()
+		s.connected = true
+		s.connectCount++
+		s.lastError = ""
+		s.mu.Unlock()
+		if err := s.readShmVideoStream(shm.video); err != nil {
+			if err != errShmUnavailable {
+				log.Printf("internal SHM video stopped: %v; falling back to 27183", err)
+			}
+		}
+		return nil
 	}
 
 	conn, err := s.openVideoSocket()
@@ -1236,15 +1400,24 @@ func (s *h264Source) ensureSession() error {
 		"audio_source=output",
 		"audio_dup=false",
 		"video_codec=h264",
+		// Internal WebRTC profile: reduce the old 8 Mbps/60 fps default and
+		// prevent fast UI movement from producing excessive burst bandwidth.
+		"video_bit_rate=6000000",
+		"max_fps=30",
 		"send_stream_meta=false",
 		"send_frame_meta=true",
 	}, "\n") + "\n"
 
 	const seq = int64(1)
-	entries := []roleEntry{{role: roleVideo, displayID: int32(s.displayID)}}
-	if s.audioEnabled {
-		entries = append(entries, roleEntry{role: roleControl, displayID: int32(s.displayID)})
-		entries = append(entries, roleEntry{role: roleAudio, displayID: int32(s.displayID)})
+	// Internal gateway path: ask the daemon for the RAM-backed SHM bridge plus
+	// the ordinary control role. ROLE_INTERNAL_SHM never opens a TCP role socket.
+	entries := []roleEntry{
+		{role: roleInternalSHM, displayID: int32(s.displayID)},
+		{role: roleControl, displayID: int32(s.displayID)},
+		// Keep the legacy video/audio declarations available as a compatibility
+		// fallback for an older daemon/SHM failure and for other external clients.
+		{role: roleVideo, displayID: int32(s.displayID)},
+		{role: roleAudio, displayID: int32(s.displayID)},
 	}
 	if err := writeConfigureSession(c, seq, options, entries); err != nil {
 		_ = c.Close()
@@ -1270,6 +1443,26 @@ func (s *h264Source) ensureSession() error {
 
 	s.session = c
 	s.sessionID = sid
+	var shm *shmTransport
+	var shmErr error
+	for i := 0; i < 30; i++ {
+		shm, shmErr = connectInternalShm(s.displayID)
+		if shmErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if shmErr == nil {
+		s.shmMu.Lock()
+		if s.shm != nil {
+			s.shm.close()
+		}
+		s.shm = shm
+		s.shmMu.Unlock()
+		log.Printf("internal SHM bridge connected: displayId=%d", s.displayID)
+	} else {
+		log.Printf("internal SHM bridge unavailable, retaining 27183 TCP fallback: %v", shmErr)
+	}
 	log.Printf("scrcpy daemon session established: sessionId=%d device=%q", sid, trimCString(meta))
 	return nil
 }
@@ -1327,6 +1520,112 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+var errShmUnavailable = fmt.Errorf("SHM ring unavailable")
+
+// requestKeyframe re-bases WebRTC output onto the newest complete IDR already
+// cached by the gateway. The Android daemon encoder continues running and the
+// next cached keyframe will be used by pipeTo; no extra 27183 bulk-media write
+// is required for SHM overruns. Rate limiting prevents a full ring from
+// generating an IDR/recovery storm.
+func (s *h264Source) requestKeyframe() {
+	now := time.Now()
+	s.mu.Lock()
+	if !s.lastKeyRequestAt.IsZero() && now.Sub(s.lastKeyRequestAt) < 500*time.Millisecond {
+		s.mu.Unlock()
+		return
+	}
+	s.keyRequest++
+	s.lastKeyRequestAt = now
+	s.pliCount++
+	s.lastPLIAt = now
+	s.mu.Unlock()
+	log.Printf("[H264-SHM] local keyframe rebase requested")
+}
+
+func (s *h264Source) readShmVideoStream(r *shmMappedRing) error {
+	var want uint64 = 1
+	for {
+		pts, flags, w, h, data, ok, overrun := r.readSeq(want)
+		if overrun {
+			s.requestKeyframe()
+			want = r.latestSeq() + 1
+			continue
+		}
+		if !ok {
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		want++
+		if flags&shmRingFlagMeta != 0 {
+			s.mu.Lock()
+			s.header.Width = w
+			s.header.Height = h
+			s.mu.Unlock()
+			continue
+		}
+		if flags&shmRingFlagPacket == 0 {
+			continue
+		}
+		config := flags&shmRingFlagConfig != 0
+		key := flags&shmRingFlagKey != 0
+		normalized, sp, pp, okNorm := normalizeH264(data)
+		if !okNorm {
+			return fmt.Errorf("unsupported H264 SHM payload size=%d first=%s", len(data), firstBytes(data, 16))
+		}
+		if hasNALType(normalized, 5) {
+			key = true
+		}
+		ff := 0
+		if config {
+			ff |= flagConfig
+		}
+		if key {
+			ff |= flagKeyFrame
+		}
+		now := time.Now()
+		s.mu.Lock()
+		if len(sp) > 0 {
+			s.sps = append([]byte(nil), sp...)
+			if p := profileLevelID(sp); p != "" {
+				s.profileLevelID = p
+			}
+		}
+		if len(pp) > 0 {
+			s.pps = append([]byte(nil), pp...)
+		}
+		if len(s.sps) > 0 && len(s.pps) > 0 {
+			s.config = annexBJoin(s.sps, s.pps)
+		}
+		if config && len(s.config) > 0 {
+			s.configFrames++
+		}
+		s.seq++
+		f := &h264Frame{seq: s.seq, ptsUs: pts, flags: ff, data: normalized, receivedAt: now}
+		s.latest = f
+		s.history = append(s.history, f)
+		cutoff := now.Add(-frameHistoryWindow)
+		firstKeep := 0
+		for firstKeep < len(s.history) && (len(s.history)-firstKeep > frameHistoryMaxFrames || s.history[firstKeep].receivedAt.Before(cutoff)) {
+			firstKeep++
+		}
+		if firstKeep > 0 {
+			s.history = append([]*h264Frame(nil), s.history[firstKeep:]...)
+		}
+		s.frames++
+		s.bytes += uint64(len(normalized))
+		s.lastFrameAt = now
+		s.lastFrameSize = len(normalized)
+		if key {
+			s.latestKey = f
+			s.keyFrames++
+		}
+		old := s.changed
+		s.changed = make(chan struct{})
+		close(old)
+		s.mu.Unlock()
+	}
+}
 
 func (s *h264Source) readScrcpyVideoStream(conn net.Conn) error {
 	bc, ok := conn.(*bufferedConn)
@@ -1525,6 +1824,31 @@ type audioFrame struct {
 	receivedAt time.Time
 }
 
+func (s *h264Source) readShmAudioStream(r *shmMappedRing) error {
+	var want uint64 = 1
+	s.mu.Lock()
+	s.audioCodecID = audioCodecOpusID
+	s.audioProtocol = "shared-memory"
+	s.audioLastError = ""
+	s.mu.Unlock()
+	for {
+		pts, flags, _, _, data, ok, overrun := r.readSeq(want)
+		if overrun {
+			want = r.latestSeq() + 1
+			continue
+		}
+		if !ok {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		want++
+		if flags&shmRingFlagPacket == 0 {
+			continue
+		}
+		s.recordAudioFrame(pts, data)
+	}
+}
+
 func (s *h264Source) runAudio() {
 	for {
 		if !s.audioEnabled {
@@ -1533,6 +1857,19 @@ func (s *h264Source) runAudio() {
 		}
 		if err := s.ensureSession(); err != nil {
 			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		s.shmMu.RLock()
+		shm := s.shm
+		s.shmMu.RUnlock()
+		if shm != nil && shm.audio != nil {
+			if err := s.readShmAudioStream(shm.audio); err != nil {
+				s.mu.Lock()
+				s.audioLastError = err.Error()
+				s.mu.Unlock()
+				log.Printf("[AUDIO-DIAG] internal SHM audio stopped: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		c, err := s.openRoleSocket(roleAudio)
@@ -1766,6 +2103,12 @@ func (s *h264Source) dropSession() {
 	s.session = nil
 	s.sessionID = 0
 	s.sessionMu.Unlock()
+	s.shmMu.Lock()
+	if s.shm != nil {
+		s.shm.close()
+		s.shm = nil
+	}
+	s.shmMu.Unlock()
 }
 
 func (s *h264Source) pollCursorURL(url string) {
@@ -3133,6 +3476,494 @@ func trimCString(b []byte) string {
 	}
 	return string(b)
 }
+
+type rawRGBAFrame struct {
+	ptsUs  int64
+	width  int
+	height int
+	data   []byte
+}
+
+func (s *h264Source) addTilePeer(dc *webrtc.DataChannel) {
+	s.rawStartOnce.Do(func() { go s.runRawTileStream(rawFrameDefaultAddr) })
+	s.tileMu.Lock()
+	s.tilePeers[dc] = struct{}{}
+	s.tileReady = false
+	s.tileMu.Unlock()
+
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if !msg.IsString {
+			return
+		}
+		var m struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(msg.Data, &m) != nil || m.Type != "base-ready" {
+			return
+		}
+		s.tileMu.Lock()
+		if _, ok := s.tilePeers[dc]; ok {
+			s.tileReady = true
+		}
+		s.tileMu.Unlock()
+		log.Printf("[TILE] browser base-ready displayId=%d", s.displayID)
+	})
+}
+
+func (s *h264Source) removeTilePeer(dc *webrtc.DataChannel) {
+	s.tileMu.Lock()
+	delete(s.tilePeers, dc)
+	if len(s.tilePeers) == 0 {
+		s.tileReady = false
+	}
+	s.tileMu.Unlock()
+}
+
+func (s *h264Source) setTileMode(enabled bool, reason string) {
+	s.tileMu.Lock()
+	changed := s.tileMode != enabled
+	s.tileMode = enabled
+	s.tileReady = false
+	s.tileLowCount = 0
+	peers := make([]*webrtc.DataChannel, 0, len(s.tilePeers))
+	for dc := range s.tilePeers {
+		peers = append(peers, dc)
+	}
+	s.tileMu.Unlock()
+	if !changed {
+		return
+	}
+	// Any tile/full transition must re-base the H264 decoder. Tile mode needs a
+	// fresh base frame; full mode needs a fresh IDR because predictive frames
+	// skipped during tile mode cannot be used as a reference on the browser.
+	s.mu.Lock()
+	s.keyRequest++
+	s.mu.Unlock()
+	mode := "full"
+	if enabled {
+		mode = "tile-pending"
+	}
+	msg := fmt.Sprintf(`{"type":"mode","mode":"%s"}`, mode)
+	for _, dc := range peers {
+		if err := dc.SendText(msg); err != nil {
+			log.Printf("[TILE] mode send failed: %v", err)
+		}
+	}
+	log.Printf("[TILE] mode=%s reason=%s", mode, reason)
+}
+
+func (s *h264Source) isTileMode() bool {
+	s.tileMu.RLock()
+	v := s.tileMode && len(s.tilePeers) > 0
+	s.tileMu.RUnlock()
+	return v
+}
+
+func (s *h264Source) isTileOutputReady() bool {
+	s.tileMu.RLock()
+	v := s.tileMode && s.tileReady && len(s.tilePeers) > 0
+	s.tileMu.RUnlock()
+	return v
+}
+
+func (s *h264Source) runRawTileStream(addr string) {
+	for {
+		s.shmMu.RLock()
+		shm := s.shm
+		s.shmMu.RUnlock()
+		if shm == nil || shm.raw == nil {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		log.Printf("[TILE] raw-frame SHM source connected displayId=%d", s.displayID)
+		if err := s.consumeRawShmFrames(shm.raw); err != nil {
+			log.Printf("[TILE] raw-frame SHM source stopped: %v", err)
+		}
+		s.tileMu.Lock()
+		s.rawLastError = ""
+		s.tileMu.Unlock()
+		s.setTileMode(false, "raw-shm-source-disconnected")
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func (s *h264Source) consumeRawShmFrames(r *shmMappedRing) error {
+	var previous []byte
+	var want uint64 = 1
+	lowCount := 0
+	tileSynced := false
+	for {
+		pts, flags, w, h, data, ok, overrun := r.readSeq(want)
+		if overrun {
+			latest := r.latestSeq()
+			want = latest + 1
+			previous = nil
+			lowCount = 0
+			tileSynced = false
+			continue
+		}
+		if !ok {
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		_ = flags
+		if w <= 0 || h <= 0 || len(data) != w*h*4 {
+			return fmt.Errorf("invalid SHM raw frame %dx%d bytes=%d", w, h, len(data))
+		}
+		frame := rawRGBAFrame{ptsUs: pts, width: w, height: h, data: data}
+		peers := s.tilePeersSnapshot()
+		hasPeers := len(peers) > 0
+		scrollDy, scrollScore, scrollOK := 0, 0.0, false
+		if hasPeers && previous != nil {
+			scrollDy, scrollScore, scrollOK = detectScrollDelta(previous, data, w, h)
+		}
+
+		changed, total := compareRawTiles(previous, &frame)
+		ratio := 1.0
+		if total > 0 {
+			ratio = float64(changed) / float64(total)
+		}
+
+		if !s.isTileMode() {
+			if hasPeers && scrollOK {
+				s.setTileMode(true, fmt.Sprintf("scroll dy=%d score=%.2f", scrollDy, scrollScore))
+				lowCount = 0
+			} else if hasPeers && ratio <= 0.12 {
+				lowCount++
+				if lowCount >= 4 {
+					s.setTileMode(true, fmt.Sprintf("changed=%.2f", ratio))
+					lowCount = 0
+				}
+			} else {
+				lowCount = 0
+			}
+		} else if !scrollOK && ratio >= 0.45 {
+			s.setTileMode(false, fmt.Sprintf("changed=%.2f", ratio))
+			lowCount = 0
+		}
+
+		if s.isTileMode() {
+			if !s.isTileOutputReady() {
+				previous = append(previous[:0], data...)
+				tileSynced = false
+				want++
+				continue
+			}
+			if !tileSynced {
+				previous = append(previous[:0], data...)
+				tileSynced = true
+				want++
+				continue
+			}
+			if scrollOK {
+				s.sendScrollDelta(scrollDy)
+				for _, tile := range changedTilesAfterScroll(previous, &frame, scrollDy) {
+					_ = s.sendTile(frame.data, frame.width, frame.height, tile.x, tile.y, tile.w, tile.h, frame.ptsUs)
+				}
+			} else {
+				for _, tile := range changedTiles(previous, &frame) {
+					_ = s.sendTile(frame.data, frame.width, frame.height, tile.x, tile.y, tile.w, tile.h, frame.ptsUs)
+				}
+			}
+		}
+		previous = append(previous[:0], data...)
+		want++
+	}
+}
+
+func (s *h264Source) consumeRawFrames(br *bufio.Reader) error {
+	var hdr [24]byte
+	if _, err := io.ReadFull(br, hdr[:]); err != nil {
+		return fmt.Errorf("raw header: %w", err)
+	}
+	if binary.BigEndian.Uint32(hdr[0:4]) != rawFrameMagic {
+		return fmt.Errorf("bad raw magic")
+	}
+	if binary.BigEndian.Uint32(hdr[4:8]) != rawFrameProtocolVersion {
+		return fmt.Errorf("unsupported raw protocol")
+	}
+	w := int(binary.BigEndian.Uint32(hdr[8:12]))
+	h := int(binary.BigEndian.Uint32(hdr[12:16]))
+	if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+		return fmt.Errorf("invalid raw size %dx%d", w, h)
+	}
+	s.tileMu.Lock()
+	s.rawWidth = w
+	s.rawHeight = h
+	s.tileMu.Unlock()
+
+	var previous []byte
+	tileSynced := false
+	for {
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return fmt.Errorf("raw frame header: %w", err)
+		}
+		if binary.BigEndian.Uint32(hdr[0:4]) != rawFrameRawMagic {
+			return fmt.Errorf("bad raw frame magic")
+		}
+		pts := int64(binary.BigEndian.Uint64(hdr[4:12]))
+		fw := int(binary.BigEndian.Uint32(hdr[12:16]))
+		fh := int(binary.BigEndian.Uint32(hdr[16:20]))
+		n := int(binary.BigEndian.Uint32(hdr[20:24]))
+		if fw != w || fh != h || n != fw*fh*4 {
+			return fmt.Errorf("invalid raw frame %dx%d bytes=%d", fw, fh, n)
+		}
+		data := make([]byte, n)
+		if _, err := io.ReadFull(br, data); err != nil {
+			return fmt.Errorf("raw frame payload: %w", err)
+		}
+		frame := rawRGBAFrame{ptsUs: pts, width: fw, height: fh, data: data}
+		peers := s.tilePeersSnapshot()
+		hasPeers := len(peers) > 0
+		scrollDy, scrollScore, scrollOK := 0, 0.0, false
+		if hasPeers && previous != nil {
+			scrollDy, scrollScore, scrollOK = detectScrollDelta(previous, data, fw, fh)
+		}
+		changed, total := compareRawTiles(previous, &frame)
+		ratio := 1.0
+		if total > 0 {
+			ratio = float64(changed) / float64(total)
+		}
+		if !s.isTileMode() {
+			if hasPeers && scrollOK {
+				s.setTileMode(true, fmt.Sprintf("scroll dy=%d score=%.2f", scrollDy, scrollScore))
+			} else if hasPeers && ratio <= 0.12 {
+				s.setTileMode(true, fmt.Sprintf("changed=%.2f", ratio))
+			}
+		} else if !scrollOK && ratio >= 0.45 {
+			s.setTileMode(false, fmt.Sprintf("changed=%.2f", ratio))
+		}
+		if s.isTileMode() {
+			if !s.isTileOutputReady() {
+				previous = append(previous[:0], data...)
+				tileSynced = false
+				continue
+			}
+			if !tileSynced {
+				previous = append(previous[:0], data...)
+				tileSynced = true
+				continue
+			}
+			if scrollOK {
+				s.sendScrollDelta(scrollDy)
+				for _, tile := range changedTilesAfterScroll(previous, &frame, scrollDy) {
+					_ = s.sendTile(frame.data, frame.width, frame.height, tile.x, tile.y, tile.w, tile.h, frame.ptsUs)
+				}
+			} else {
+				for _, tile := range changedTiles(previous, &frame) {
+					_ = s.sendTile(frame.data, frame.width, frame.height, tile.x, tile.y, tile.w, tile.h, frame.ptsUs)
+				}
+			}
+		}
+		previous = append(previous[:0], data...)
+	}
+}
+
+func (s *h264Source) tilePeersSnapshot() []*webrtc.DataChannel {
+	s.tileMu.RLock()
+	defer s.tileMu.RUnlock()
+	out := make([]*webrtc.DataChannel, 0, len(s.tilePeers))
+	for dc := range s.tilePeers {
+		out = append(out, dc)
+	}
+	return out
+}
+
+type rawTile struct{ x, y, w, h int }
+
+func compareRawTiles(previous []byte, frame *rawRGBAFrame) (int, int) {
+	tiles := 0
+	changed := 0
+	for y := 0; y < frame.height; y += rawFrameTileSize {
+		for x := 0; x < frame.width; x += rawFrameTileSize {
+			tiles++
+			if previous == nil || rawTileChanged(previous, frame.data, frame.width, frame.height, x, y, minInt(rawFrameTileSize, frame.width-x), minInt(rawFrameTileSize, frame.height-y)) {
+				changed++
+			}
+		}
+	}
+	return changed, tiles
+}
+
+func changedTiles(previous []byte, frame *rawRGBAFrame) []rawTile {
+	out := make([]rawTile, 0, 16)
+	for y := 0; y < frame.height; y += rawFrameTileSize {
+		for x := 0; x < frame.width; x += rawFrameTileSize {
+			w := minInt(rawFrameTileSize, frame.width-x)
+			h := minInt(rawFrameTileSize, frame.height-y)
+			if previous == nil || rawTileChanged(previous, frame.data, frame.width, frame.height, x, y, w, h) {
+				out = append(out, rawTile{x, y, w, h})
+			}
+		}
+	}
+	return out
+}
+
+func detectScrollDelta(previous, current []byte, width, height int) (int, float64, bool) {
+	if len(previous) != len(current) || width < 2 || height < 2 {
+		return 0, 0, false
+	}
+	base := scrollMatchScore(previous, current, width, height, 0)
+	bestDy := 0
+	best := base
+	for dy := -160; dy <= 160; dy += 4 {
+		if dy == 0 {
+			continue
+		}
+		score := scrollMatchScore(previous, current, width, height, dy)
+		if score > best {
+			best = score
+			bestDy = dy
+		}
+	}
+	if bestDy == 0 || best < 0.48 || best-base < 0.10 {
+		return 0, best, false
+	}
+	return bestDy, best, true
+}
+
+func scrollMatchScore(previous, current []byte, width, height, shiftY int) float64 {
+	y0, y1 := 0, height
+	if shiftY > 0 {
+		y0 = shiftY
+	} else if shiftY < 0 {
+		y1 = height + shiftY
+	}
+	if y0 >= y1 {
+		return 0
+	}
+	matches := 0
+	total := 0
+	for y := y0; y < y1; y += 16 {
+		prevY := y - shiftY
+		for x := 0; x < width; x += 16 {
+			pi := (prevY*width + x) * 4
+			ci := (y*width + x) * 4
+			if pi < 0 || ci < 0 || pi+3 >= len(previous) || ci+3 >= len(current) {
+				continue
+			}
+			total++
+			if previous[pi] == current[ci] && previous[pi+1] == current[ci+1] &&
+				previous[pi+2] == current[ci+2] && previous[pi+3] == current[ci+3] {
+				matches++
+			}
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(matches) / float64(total)
+}
+
+func changedTilesAfterScroll(previous []byte, frame *rawRGBAFrame, shiftY int) []rawTile {
+	out := make([]rawTile, 0, 16)
+	for y := 0; y < frame.height; y += rawFrameTileSize {
+		for x := 0; x < frame.width; x += rawFrameTileSize {
+			w := minInt(rawFrameTileSize, frame.width-x)
+			h := minInt(rawFrameTileSize, frame.height-y)
+			if !rawTileEquivalentAtShift(previous, frame.data, frame.width, frame.height, x, y, w, h, shiftY) {
+				out = append(out, rawTile{x, y, w, h})
+			}
+		}
+	}
+	return out
+}
+
+func rawTileEquivalentAtShift(a, b []byte, width, height, x, y, w, h, shiftY int) bool {
+	prevY := y - shiftY
+	if prevY < 0 || prevY+h > height {
+		return false
+	}
+	matches := 0
+	total := 0
+	for yy := 0; yy < h; yy += 8 {
+		for xx := 0; xx < w; xx += 8 {
+			pi := ((prevY+yy)*width + x + xx) * 4
+			ci := ((y+yy)*width + x + xx) * 4
+			if pi < 0 || ci < 0 || pi+3 >= len(a) || ci+3 >= len(b) {
+				continue
+			}
+			total++
+			if a[pi] == b[ci] && a[pi+1] == b[ci+1] && a[pi+2] == b[ci+2] && a[pi+3] == b[ci+3] {
+				matches++
+			}
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return float64(matches)/float64(total) >= 0.82
+}
+
+func rawTileChanged(a, b []byte, width, height, x, y, w, h int) bool {
+	// Fast sampled FNV-1a; sampling one pixel in each 4x4 block is enough to
+	// detect normal UI changes while keeping the gateway-side compare cheap.
+	var ha uint64 = 1469598103934665603
+	var hb uint64 = 1469598103934665603
+	for yy := y; yy < y+h; yy += 4 {
+		base := yy * width * 4
+		for xx := x; xx < x+w; xx += 4 {
+			i := base + xx*4
+			for k := 0; k < 4; k++ {
+				ha ^= uint64(a[i+k])
+				ha *= 1099511628211
+				hb ^= uint64(b[i+k])
+				hb *= 1099511628211
+			}
+		}
+	}
+	return ha != hb
+}
+
+func (s *h264Source) sendScrollDelta(dy int) {
+	if dy == 0 {
+		return
+	}
+	msg := fmt.Sprintf(`{"type":"scroll","dy":%d}`, dy)
+	for _, dc := range s.tilePeersSnapshot() {
+		if err := dc.SendText(msg); err != nil {
+			s.removeTilePeer(dc)
+		}
+	}
+}
+
+func (s *h264Source) sendTile(data []byte, width, height, x, y, w, h int, ptsUs int64) error {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for row := 0; row < h; row++ {
+		srcStart := ((y+row)*width + x) * 4
+		dstStart := row * w * 4
+		copy(img.Pix[dstStart:dstStart+w*4], data[srcStart:srcStart+w*4])
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 72}); err != nil {
+		return err
+	}
+	payload := buf.Bytes()
+	packet := make([]byte, 24+len(payload))
+	binary.BigEndian.PutUint32(packet[0:4], rawFrameTileMagic)
+	binary.BigEndian.PutUint32(packet[4:8], uint32(time.Now().UnixNano()/1e6))
+	binary.BigEndian.PutUint32(packet[8:10], uint32(x))
+	binary.BigEndian.PutUint32(packet[10:12], uint32(y))
+	binary.BigEndian.PutUint32(packet[12:14], uint32(w))
+	binary.BigEndian.PutUint32(packet[14:16], uint32(h))
+	binary.BigEndian.PutUint32(packet[16:20], uint32(len(payload)))
+	binary.BigEndian.PutUint32(packet[20:24], uint32(ptsUs&0xffffffff))
+	copy(packet[24:], payload)
+	for _, dc := range s.tilePeersSnapshot() {
+		if err := dc.Send(packet); err != nil {
+			s.removeTilePeer(dc)
+		}
+	}
+	return nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (s *h264Source) pipeTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.PeerConnection) {
 	var lastSeq uint64
 	var ptsBaseUs int64 = -1
@@ -3271,6 +4102,13 @@ func (s *h264Source) pipeTo(track *webrtc.TrackLocalStaticSample, pc *webrtc.Pee
 
 		data := next.data
 		isKey := next.flags&flagKeyFrame != 0
+		if s.isTileMode() && !isKey {
+			// Tile-delta mode owns incremental updates. Keep the H264 track alive but
+			// do not send predictive frames over the network. A mode transition requests
+			// a fresh IDR through keyRequest, so the browser can re-base its canvas.
+			lastSeq = next.seq
+			continue
+		}
 		if isKey && len(cfg) > 0 && !containsSPSPPS(data) {
 			merged := make([]byte, 0, len(cfg)+len(data))
 			merged = append(merged, cfg...)
@@ -3546,4 +4384,165 @@ func getenv(k, d string) string {
 		return v
 	}
 	return d
+}
+
+// -----------------------------------------------------------------------------
+// Android/Linux internal SharedMemory transport (merged from internal_shm_linux.go)
+// -----------------------------------------------------------------------------
+
+const internalShmMagic uint32 = 0x56445342 // VDSB
+const internalShmVersion uint32 = 1
+const shmHeaderSize = 64
+const shmSlotHeaderSize = 32
+
+type shmMappedRing struct {
+	fd         int
+	data       []byte
+	size       int
+	typ        uint32
+	slots      int
+	payloadMax int
+	slotStride int
+}
+
+type shmTransport struct {
+	video *shmMappedRing
+	audio *shmMappedRing
+	raw   *shmMappedRing
+}
+
+func connectInternalShm(displayID int) (*shmTransport, error) {
+	name := "@virtualdisplay-shm-" + fmt.Sprint(displayID)
+	c, err := net.DialTimeout("unix", name, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	uc := c.(*net.UnixConn)
+	defer uc.Close()
+	_ = uc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 128)
+	oob := make([]byte, syscall.CmsgSpace(3*4))
+	n, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
+	if err != nil {
+		return nil, err
+	}
+	if n < 68 {
+		return nil, fmt.Errorf("short SHM metadata: %d", n)
+	}
+	if binary.BigEndian.Uint32(buf[0:4]) != internalShmMagic || binary.BigEndian.Uint32(buf[4:8]) != internalShmVersion {
+		return nil, fmt.Errorf("bad SHM metadata header")
+	}
+	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return nil, err
+	}
+	var fds []int
+	for _, m := range msgs {
+		fs, err := syscall.ParseUnixRights(&m)
+		if err != nil {
+			return nil, err
+		}
+		fds = append(fds, fs...)
+	}
+	if len(fds) < 3 {
+		return nil, fmt.Errorf("SHM bridge sent %d fds, want 3", len(fds))
+	}
+	off := 20
+	rings := make([]*shmMappedRing, 0, 3)
+	for i := 0; i < 3; i++ {
+		typ := binary.BigEndian.Uint32(buf[off : off+4])
+		size := int(binary.BigEndian.Uint32(buf[off+4 : off+8]))
+		slots := int(binary.BigEndian.Uint32(buf[off+8 : off+12]))
+		payload := int(binary.BigEndian.Uint32(buf[off+12 : off+16]))
+		off += 16
+		r, err := mapShmRing(fds[i], size, typ, slots, payload)
+		if err != nil {
+			for _, fd := range fds {
+				_ = syscall.Close(fd)
+			}
+			return nil, err
+		}
+		rings = append(rings, r)
+	}
+	return &shmTransport{video: rings[0], audio: rings[1], raw: rings[2]}, nil
+}
+
+func (s *shmTransport) close() {
+	if s == nil {
+		return
+	}
+	if s.video != nil {
+		s.video.close()
+		s.video = nil
+	}
+	if s.audio != nil {
+		s.audio.close()
+		s.audio = nil
+	}
+	if s.raw != nil {
+		s.raw.close()
+		s.raw = nil
+	}
+}
+
+func mapShmRing(fd, size int, typ uint32, slots, payloadMax int) (*shmMappedRing, error) {
+	if size < shmHeaderSize || slots <= 0 || payloadMax <= 0 {
+		return nil, fmt.Errorf("invalid SHM ring size=%d slots=%d payload=%d", size, slots, payloadMax)
+	}
+	data, err := syscall.Mmap(fd, 0, size, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, err
+	}
+	if binary.BigEndian.Uint32(data[0:4]) != 0x56445348 || binary.BigEndian.Uint32(data[4:8]) != 1 {
+		_ = syscall.Munmap(data)
+		return nil, fmt.Errorf("bad ring header")
+	}
+	return &shmMappedRing{fd: fd, data: data, size: size, typ: typ, slots: slots, payloadMax: payloadMax, slotStride: shmSlotHeaderSize + payloadMax}, nil
+}
+
+func (r *shmMappedRing) close() {
+	if r == nil {
+		return
+	}
+	if r.data != nil {
+		_ = syscall.Munmap(r.data)
+		r.data = nil
+	}
+	if r.fd >= 0 {
+		_ = syscall.Close(r.fd)
+		r.fd = -1
+	}
+}
+
+func (r *shmMappedRing) latestSeq() uint64 { return binary.BigEndian.Uint64(r.data[32:40]) }
+
+func (r *shmMappedRing) readSeq(want uint64) (pts int64, flags uint32, w, h int, payload []byte, ok bool, overrun bool) {
+	latest := r.latestSeq()
+	if latest < want {
+		return 0, 0, 0, 0, nil, false, false
+	}
+	if latest-want >= uint64(r.slots) {
+		return 0, 0, 0, 0, nil, false, true
+	}
+	slot := int((want - 1) % uint64(r.slots))
+	base := shmHeaderSize + slot*r.slotStride
+	seq1 := binary.BigEndian.Uint64(r.data[base : base+8])
+	if seq1 != want {
+		return 0, 0, 0, 0, nil, false, seq1 > want
+	}
+	flags = binary.BigEndian.Uint32(r.data[base+16 : base+20])
+	n := int(binary.BigEndian.Uint32(r.data[base+20 : base+24]))
+	w = int(binary.BigEndian.Uint32(r.data[base+24 : base+28]))
+	h = int(binary.BigEndian.Uint32(r.data[base+28 : base+32]))
+	if n < 0 || n > r.payloadMax {
+		return 0, 0, 0, 0, nil, false, false
+	}
+	pts = int64(binary.BigEndian.Uint64(r.data[base+8 : base+16]))
+	p := make([]byte, n)
+	copy(p, r.data[base+32:base+32+n])
+	seq2 := binary.BigEndian.Uint64(r.data[base : base+8])
+	if seq2 != seq1 {
+		return 0, 0, 0, 0, nil, false, false
+	}
+	return pts, flags, w, h, p, true, false
 }

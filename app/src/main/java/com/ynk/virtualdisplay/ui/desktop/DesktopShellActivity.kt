@@ -688,9 +688,10 @@ class DesktopShellActivity : ComponentActivity() {
         // animation step: apply one immediate pixel delta per sample. Touch
         // scrolling convention is opposite the finger movement (drag right ->
         // content moves left), so the sign is intentionally inverted here.
-        // A 2x gain restores the useful trackpad travel that the old wheel-style
-        // mapping lost, while the user preference multiplier remains effective.
-        val drawerGain = 2f
+        // The current drawer path uses immediate pixel deltas. Increase the
+        // drawer-specific gain 3x (2x -> 6x) while preserving the user's
+        // global scroll-sensitivity multiplier in InputController.
+        val drawerGain = 6f
         val deltaX = (-hScroll * dp(288) * drawerGain).roundToInt()
         val deltaY = (-vScroll * dp(288) * drawerGain).roundToInt()
         return when {
@@ -1309,12 +1310,21 @@ class DesktopShellActivity : ComponentActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             val running = gatewayProcessController.isRunning()
             if (running) {
+                // Second DLNA click keeps the existing gateway alive but switches
+                // this entry point to local-preview suppression. Clear the first-
+                // launch exception before applying the suppression.
+                DisplayActivity.setDlnaKeepLocalPreviewForDisplay(displayId, false)
                 DisplayActivity.setLocalPreviewSuppressedForDisplay(displayId, true)
                 runOnUiThread {
                     Toast.makeText(this@DesktopShellActivity, "已按 WebRTC 控制隐藏本机画面", Toast.LENGTH_SHORT).show()
                 }
                 return@launch
             }
+
+            // The first DLNA launch intentionally keeps the local preview. This
+            // call now also immediately re-enables local decoding and invalidates
+            // any older asynchronous suppression request before the gateway starts.
+            DisplayActivity.setDlnaKeepLocalPreviewForDisplay(displayId, true)
 
             val expectedWidth = display?.width?.takeIf { it > 0 } ?: 0
             val expectedHeight = display?.height?.takeIf { it > 0 } ?: 0
@@ -1332,6 +1342,7 @@ class DesktopShellActivity : ComponentActivity() {
                 }
             }.onFailure { error ->
                 Log.e("DesktopShell", "Failed to start DLNA gateway", error)
+                DisplayActivity.setDlnaKeepLocalPreviewForDisplay(displayId, false)
                 runOnUiThread {
                     Toast.makeText(this@DesktopShellActivity, "DLNA 网关启动失败：${error.message}", Toast.LENGTH_LONG).show()
                 }

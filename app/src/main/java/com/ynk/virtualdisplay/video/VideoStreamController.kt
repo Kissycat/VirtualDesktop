@@ -37,6 +37,10 @@ class VideoStreamController(
     @Volatile private var encodedHeight = 0
     @Volatile private var running = false
 
+    // Persist the local-decoder policy across H264StreamDecoder recreation.
+    // Surface/format changes must not silently restore local MediaCodec decoding.
+    @Volatile private var localVideoDecodeEnabled = true
+
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
     var onStreamEnded: ((reason: String) -> Unit)? = null
     var onPerformanceStats: ((String) -> Unit)? = null
@@ -138,6 +142,7 @@ class VideoStreamController(
             d.ultraLowLatency = settingsDataSource?.getUltraLowLatencySync()
                 ?: AppSettings.getUltraLowLatencySync()
             encodedVideoSinks.forEach { d.addEncodedVideoSink(it) }
+            d.setLocalDecodeEnabled(localVideoDecodeEnabled)
             surface?.let { d.setDisplaySurface(it) }
             d.start()
             decoder = d
@@ -202,6 +207,7 @@ class VideoStreamController(
 
     /** Toggle only local MediaCodec decoding. Does not reconnect or modify any socket. */
     fun setLocalVideoDecodeEnabled(enabled: Boolean) {
+        localVideoDecodeEnabled = enabled
         decoder?.setLocalDecodeEnabled(enabled)
     }
 
