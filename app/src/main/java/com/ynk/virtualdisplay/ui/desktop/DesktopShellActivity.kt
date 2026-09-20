@@ -202,6 +202,22 @@ class DesktopShellActivity : ComponentActivity() {
     private var desktopRoot: View? = null
     private var desktopWindowLayer: FrameLayout? = null
     private var desktopWindowOverlayHost: DesktopWindowOverlayHost? = null
+
+    private val desktopDisplayListener = object : android.hardware.display.DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != desktopDisplayId) return
+            val decor = window.decorView
+            decor.post { refreshDesktopDisplayGeometry() }
+            // Some platform builds deliver the DisplayManager callback before
+            // Display.width/height expose the new geometry. A second pass covers
+            // that ordering without polling continuously.
+            decor.postDelayed({ refreshDesktopDisplayGeometry() }, 120L)
+        }
+    }
+
     private var desktopTaskbar: View? = null
     private var dockClock: TextView? = null
     private var dockClockJob: Job? = null
@@ -337,6 +353,47 @@ class DesktopShellActivity : ComponentActivity() {
 
         ensureDockOverlayAttached()
         syncDockVisibility()
+
+        getSystemService(android.hardware.display.DisplayManager::class.java)
+            ?.registerDisplayListener(desktopDisplayListener, null)
+        refreshDesktopDisplayGeometry()
+    }
+
+    /**
+     * Synchronize every display-local surface with the current VirtualDisplay
+     * geometry after a resolution/DPI change.
+     */
+    private fun refreshDesktopDisplayGeometry() {
+        if (isFinishing || isDestroyed) return
+        val targetDisplay = display ?: return
+        val width = targetDisplay.width
+        val height = targetDisplay.height
+        if (width <= 0 || height <= 0) return
+
+        desktopWindowOverlayHost?.updateDisplayGeometry(width, height)
+        desktopWindows.toList().forEach { window ->
+            runCatching { window.onDesktopDisplaySizeChanged(width, height) }
+                .onFailure { Log.w("DesktopShell", "Failed to update desktop window geometry", it) }
+        }
+
+        // The Dock is another display-sized overlay window and must follow the
+        // same resolution change.
+        dockAnimation?.cancel()
+        dockAnimation = null
+        val dock = desktopTaskbar
+        val wm = dockOverlayWindowManager
+        val params = dockOverlayParams
+        if (dock != null && wm != null && params != null && dockOverlayAttached) {
+            val target = if (dockIsDocked) dockedDockParams() else floatingDockParams()
+            params.width = target.width
+            params.x = target.x
+            params.y = target.y
+            runCatching { wm.updateViewLayout(dock, params) }
+                .onFailure { Log.w("DesktopShell", "Failed to update Dock geometry", it) }
+        }
+
+        desktopRoot?.requestLayout()
+        desktopRoot?.invalidate()
     }
 
     internal fun addDesktopWindowView(view: View, width: Int, height: Int, x: Int, y: Int) {
@@ -425,6 +482,8 @@ class DesktopShellActivity : ComponentActivity() {
         desktopWindows.clear()
         desktopWindowOverlayHost?.detach()
         desktopWindowOverlayHost = null
+        getSystemService(android.hardware.display.DisplayManager::class.java)
+            ?.unregisterDisplayListener(desktopDisplayListener)
         instances.remove(desktopDisplayId)
         super.onDestroy()
     }
@@ -1321,9 +1380,9 @@ class DesktopShellActivity : ComponentActivity() {
                 return@launch
             }
 
-            // The first DLNA launch intentionally keeps the local preview. This
-            // call now also immediately re-enables local decoding and invalidates
-            // any older asynchronous suppression request before the gateway starts.
+            // The first DLNA launch intentionally keeps the local preview. Set
+            // this before starting the gateway so DisplayActivity's 500 ms monitor
+            // cannot hide the local decoder merely because desktopMode is active.
             DisplayActivity.setDlnaKeepLocalPreviewForDisplay(displayId, true)
 
             val expectedWidth = display?.width?.takeIf { it > 0 } ?: 0
@@ -1920,6 +1979,8 @@ class DesktopShellActivity : ComponentActivity() {
                     Toast.makeText(this@DesktopShellActivity, "已调整为 ${width}×${height} @ ${dpi} DPI", Toast.LENGTH_SHORT).show()
                     desktopRoot?.requestLayout()
                     desktopRoot?.invalidate()
+                    desktopRoot?.post { refreshDesktopDisplayGeometry() }
+                    desktopRoot?.postDelayed({ refreshDesktopDisplayGeometry() }, 150L)
                 }.onFailure {
                     Toast.makeText(this@DesktopShellActivity, "调整失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
                 }

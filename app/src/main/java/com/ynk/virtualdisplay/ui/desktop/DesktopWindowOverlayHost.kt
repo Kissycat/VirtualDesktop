@@ -89,6 +89,26 @@ internal class DesktopWindowOverlayHost(
      * keyboard focus; the input router decides when this window may intercept
      * pointer events.
      */
+    /**
+     * The VirtualDisplay can be resized without recreating DesktopShellActivity.
+     * Keep the visual host's WindowManager bounds synchronized with the new
+     * display size, otherwise newly exposed pixels have nowhere to draw.
+     */
+    fun updateDisplayGeometry(width: Int, height: Int) {
+        if (!attached) return
+        val w = width.coerceAtLeast(1)
+        val h = height.coerceAtLeast(1)
+        if (params.width == w && params.height == h) return
+        params.width = w
+        params.height = h
+        runCatching {
+            wm.updateViewLayout(host, params)
+            host.requestLayout()
+        }.onFailure {
+            Log.w(TAG, "Failed to update desktop overlay host geometry ${w}x${h}", it)
+        }
+    }
+
     fun setInputInteractive(interactive: Boolean, forceUpdate: Boolean = false) {
         if (!attached) return
         if (!forceUpdate && inputInteractive == interactive) return

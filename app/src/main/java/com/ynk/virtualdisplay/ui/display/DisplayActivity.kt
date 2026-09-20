@@ -65,6 +65,12 @@ class DisplayActivity : ComponentActivity() {
         // playback), or when the activity is destroyed.
         private val dlnaKeepLocalPreviewDisplays = ConcurrentHashMap.newKeySet<Int>()
 
+        // Explicit user choice from the eye button. null = follow the normal
+        // WebRTC/DLNA policy; true = force local video drop; false = force local
+        // preview on. This override intentionally has higher priority than the
+        // floating-WebRTC sticky marker so the eye button remains independent.
+        private val localPreviewDropOverrides = ConcurrentHashMap<Int, Boolean>()
+
         /**
          * Mark the first DLNA launch as a local-preview-preserving launch. The
          * marker is set before gateway startup so the gateway monitor cannot race
@@ -74,8 +80,10 @@ class DisplayActivity : ComponentActivity() {
             if (keep) {
                 // A fresh DLNA first launch is an explicit request to keep the
                 // local preview. Clear any stale floating-WebRTC sticky marker
-                // first so that policy can never be overridden back to hidden.
+                // and any previous eye-button override so this first DLNA launch
+                // deterministically keeps the local preview visible.
                 floatingWebRtcSuppressedDisplays.remove(displayId)
+                localPreviewDropOverrides.remove(displayId)
                 dlnaKeepLocalPreviewDisplays.add(displayId)
             } else {
                 dlnaKeepLocalPreviewDisplays.remove(displayId)
@@ -104,6 +112,7 @@ class DisplayActivity : ComponentActivity() {
          */
         fun setLocalPreviewSuppressedForDisplay(displayId: Int, suppressed: Boolean): Boolean {
             val activity = instances[displayId]?.get() ?: return false
+            localPreviewDropOverrides[displayId] = suppressed
             activity.runOnUiThread {
                 if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
                 activity.lifecycleScope.launch {
@@ -112,6 +121,11 @@ class DisplayActivity : ComponentActivity() {
                 }
             }
             return true
+        }
+
+        fun isLocalPreviewSuppressedForDisplay(displayId: Int): Boolean {
+            return localPreviewDropOverrides[displayId]
+                ?: floatingWebRtcSuppressedDisplays.contains(displayId)
         }
 
         fun createIntent(
@@ -302,6 +316,8 @@ class DisplayActivity : ComponentActivity() {
         }
         remoteDisplayId?.let { id ->
             floatingWebRtcSuppressedDisplays.remove(id)
+            dlnaKeepLocalPreviewDisplays.remove(id)
+            localPreviewDropOverrides.remove(id)
             val current = instances[id]?.get()
             if (current === this) instances.remove(id)
         }
@@ -440,7 +456,11 @@ class DisplayActivity : ComponentActivity() {
             onTrackpadClick = { toggleTrackpadMode() },
             showTrackpadButton = !desktopMode,
             onWebRtcClick = { toggleWebRtc() },
+            onLocalPreviewToggleClick = { toggleLocalPreviewDrop() },
             onCloseClick = { finish() },
+        )
+        controlPanel.setLocalPreviewSuppressed(
+            shouldHideLocalPreview(gatewayProcessController.isRunning())
         )
         rootLayout.addView(controlPanel)
 
@@ -473,20 +493,29 @@ class DisplayActivity : ComponentActivity() {
             while (!isFinishing && !isDestroyed) {
                 val running = gatewayProcessController.isRunning()
                 val stickySuppressed = isFloatingWebRtcLocalPreviewSuppressed()
+                val displayId = remoteDisplayId
+                val override = displayId?.let { localPreviewDropOverrides[it] }
 
-                // DLNA first launch deliberately keeps local playback. Do not
-                // clear the marker merely because gateway startup briefly reports
-                // not-running. It is explicitly cleared by the second DLNA click,
-                // floating WebRTC, or activity destruction.
-                if (isDlnaKeepLocalPreview()) {
-                    setLocalDecodeSuppressedSync(false)
-                }
+                // The eye-button choice is authoritative while present.
+                // This prevents the WebRTC sticky monitor or desktop-mode fallback
+                // from fighting an explicit user command.
+                if (override != null) {
+                    setLocalDecodeSuppressedSync(override)
+                } else {
+                    // DLNA first launch deliberately keeps local playback. Do not
+                    // clear the marker merely because gateway startup briefly reports
+                    // not-running. It is explicitly cleared by the second DLNA click,
+                    // floating WebRTC, or activity destruction.
+                    if (isDlnaKeepLocalPreview()) {
+                        setLocalDecodeSuppressedSync(false)
+                    }
 
-                // Keep the floating-WebRTC sticky policy asserted independently
-                // of gateway liveness. VideoStreamController also persists this
-                // flag across decoder recreation.
-                if (stickySuppressed) {
-                    setLocalDecodeSuppressedSync(true)
+                    // Keep the floating-WebRTC sticky policy asserted independently
+                    // of gateway liveness. VideoStreamController also persists this
+                    // flag across decoder recreation.
+                    if (stickySuppressed) {
+                        setLocalDecodeSuppressedSync(true)
+                    }
                 }
 
                 if (running != desktopWebRtcRunning) {
@@ -509,6 +538,12 @@ class DisplayActivity : ComponentActivity() {
     }
 
     private fun shouldHideLocalPreview(webRtcRunning: Boolean): Boolean {
+        remoteDisplayId?.let { displayId ->
+            // The eye-button override is an explicit user command and therefore
+            // outranks every automatic WebRTC/DLNA policy.
+            localPreviewDropOverrides[displayId]?.let { return it }
+        }
+
         // Once WebRTC is explicitly enabled from the floating control, the local
         // decoder stays disabled until that same control explicitly stops WebRTC.
         if (isFloatingWebRtcLocalPreviewSuppressed()) return true
@@ -555,6 +590,7 @@ class DisplayActivity : ComponentActivity() {
         }
         if (::controlPanel.isInitialized) {
             controlPanel.visibility = View.VISIBLE
+            controlPanel.setLocalPreviewSuppressed(suppressed)
         }
         // Do not use the preview state as a command to show diagnostics.
         // The diagnostics switch in Settings remains authoritative across all
@@ -632,6 +668,31 @@ class DisplayActivity : ComponentActivity() {
         Log.i(TAG, "trackpadEnabled=$trackpadEnabled running=$running hideLocalPreview=$hideLocalPreview")
     }
 
+    private fun toggleLocalPreviewDrop() {
+        val displayId = remoteDisplayId
+        if (displayId == null || displayId < 0) return
+
+        val current = shouldHideLocalPreview(gatewayProcessController.isRunning())
+        val next = !current
+
+        // The eye button is the explicit user override. In particular, it can
+        // override the WebRTC startup sticky policy and keep the local decoder on
+        // without touching the WebRTC connection itself.
+        localPreviewDropOverrides[displayId] = next
+        localPreviewPolicyGeneration.incrementAndGet()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            setLocalDecodeSuppressedSync(next)
+        }
+        applyLocalPreviewUi(next)
+
+        Log.i(
+            TAG,
+            "Local preview eye toggle: displayId=$displayId suppressed=$next " +
+                "gatewayRunning=${gatewayProcessController.isRunning()}"
+        )
+    }
+
     private fun toggleWebRtc() {
         val displayId = remoteDisplayId
         if (displayId == null || displayId < 0) {
@@ -642,6 +703,7 @@ class DisplayActivity : ComponentActivity() {
             if (gatewayProcessController.isRunning()) {
                 // Explicit floating-button stop ends both entry-point markers.
                 floatingWebRtcSuppressedDisplays.remove(displayId)
+                localPreviewDropOverrides.remove(displayId)
                 dlnaKeepLocalPreviewDisplays.remove(displayId)
                 setLocalDecodeSuppressedSync(false)
                 runCatching { gatewayProcessController.stop() }
@@ -658,8 +720,10 @@ class DisplayActivity : ComponentActivity() {
             // any previous DLNA first-launch marker.
             dlnaKeepLocalPreviewDisplays.remove(displayId)
 
-            // Mark this before gateway startup so even
-            // a slow/failed handshake cannot temporarily re-enable local decode.
+            // Mark this before gateway startup so even a slow/failed handshake
+            // cannot temporarily re-enable local decode. The eye-button override
+            // starts in the hidden state as well, but can be toggled independently.
+            localPreviewDropOverrides[displayId] = true
             floatingWebRtcSuppressedDisplays.add(displayId)
             setLocalDecodeSuppressedSync(true)
             runOnUiThread { applyLocalPreviewUi(true) }
@@ -682,6 +746,7 @@ class DisplayActivity : ComponentActivity() {
                 Log.e(TAG, "Failed to start WebRTC gateway", error)
                 // The activation never completed, so undo the sticky policy.
                 floatingWebRtcSuppressedDisplays.remove(displayId)
+                localPreviewDropOverrides.remove(displayId)
                 dlnaKeepLocalPreviewDisplays.remove(displayId)
                 setLocalDecodeSuppressedSync(false)
                 runOnUiThread {
@@ -711,11 +776,11 @@ class DisplayActivity : ComponentActivity() {
             }
 
             // Surface rebinds are another point where a fresh decoder/output
-            // path may otherwise make the local preview visible again.
-            if (isFloatingWebRtcLocalPreviewSuppressed()) {
-                setLocalDecodeSuppressedSync(true)
-                applyLocalPreviewUi(true)
-            }
+            // path may otherwise drift away from the explicit eye/WebRTC/DLNA
+            // preview policy.
+            val suppressed = shouldHideLocalPreview(gatewayProcessController.isRunning())
+            setLocalDecodeSuppressedSync(suppressed)
+            applyLocalPreviewUi(suppressed)
         }
     }
 

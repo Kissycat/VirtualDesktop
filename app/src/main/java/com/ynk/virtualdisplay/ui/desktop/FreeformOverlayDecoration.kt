@@ -848,14 +848,19 @@ internal class FreeformOverlayDecoration(
     }
 
     private fun clampInScreen() {
+        val display = activity.display ?: desktopDisplay
+        clampInScreen(display.width, display.height)
+    }
+
+    private fun clampInScreen(screenWidth: Int, screenHeight: Int) {
         val currentW = root.measuredWidth.takeIf { it > 0 }
             ?: (contentWidth)
         val currentH = root.measuredHeight.takeIf { it > 0 }
             ?: (contentHeight + if (hanging) 0 else topChrome + bottomChrome)
-        val maxX = (desktopDisplay.width - currentW).coerceAtLeast(0)
-        val maxY = (desktopDisplay.height - currentH).coerceAtLeast(0)
-        windowX = windowX.coerceIn(-desktopDisplay.width / 2, maxX + activity.dpPublic(80))
-        windowY = windowY.coerceIn(-desktopDisplay.height / 2, maxY + activity.dpPublic(80))
+        val maxX = (screenWidth - currentW).coerceAtLeast(0)
+        val maxY = (screenHeight - currentH).coerceAtLeast(0)
+        windowX = windowX.coerceIn(-screenWidth / 2, maxX + activity.dpPublic(80))
+        windowY = windowY.coerceIn(-screenHeight / 2, maxY + activity.dpPublic(80))
         updateAttachedLayout()
     }
 
@@ -879,6 +884,56 @@ internal class FreeformOverlayDecoration(
             windowSession, desktopDisplay.displayId, windowX, windowY,
             inputWidth, inputHeight, if (hanging) 0 else topChrome
         )
+    }
+
+    /**
+     * Called when the parent Desktop VirtualDisplay changes resolution.
+     *
+     * Non-maximized windows keep their size/position whenever possible, but
+     * their new bounds are clamped against the new display. Maximized windows
+     * are resized to the new full-display content area.
+     */
+    internal fun onDesktopDisplaySizeChanged(screenWidth: Int, screenHeight: Int) {
+        if (released || closing) return
+
+        var contentChanged = false
+
+        if (maximized) {
+            val newContentWidth = screenWidth.coerceAtLeast(activity.dpPublic(MIN_W_DP))
+            val newContentHeight = (screenHeight - topChrome - activity.desktopDockHeightPublic())
+                .coerceAtLeast(activity.dpPublic(MIN_H_DP))
+            if (contentWidth != newContentWidth || contentHeight != newContentHeight ||
+                windowX != 0 || windowY != 0) {
+                contentWidth = newContentWidth
+                contentHeight = newContentHeight
+                windowX = 0
+                windowY = 0
+                contentChanged = true
+            }
+        } else {
+            // A larger desktop reveals previously clipped parts of the window
+            // without resizing it. A smaller desktop shrinks only when necessary
+            // so the whole window remains addressable.
+            val chromeHeight = if (hanging || minimized) 0 else topChrome + bottomChrome
+            val maxContentWidth = (screenWidth - windowX).coerceAtLeast(activity.dpPublic(MIN_W_DP))
+            val maxContentHeight = (screenHeight - windowY - chromeHeight)
+                .coerceAtLeast(activity.dpPublic(MIN_H_DP))
+
+            val newContentWidth = contentWidth.coerceAtMost(maxContentWidth)
+            val newContentHeight = contentHeight.coerceAtMost(maxContentHeight)
+            if (newContentWidth != contentWidth || newContentHeight != contentHeight) {
+                contentWidth = newContentWidth
+                contentHeight = newContentHeight
+                contentChanged = true
+            }
+        }
+
+        if (contentChanged) {
+            applyRootSize()
+            scheduleSessionResize()
+        }
+        clampInScreen(screenWidth, screenHeight)
+        activity.commitDesktopWindowOverlayGeometry(root)
     }
 
     private fun closeWindowFromSessionEnd() {

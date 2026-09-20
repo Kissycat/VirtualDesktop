@@ -30,6 +30,7 @@ class DisplayControlPanel(
     private val onTrackpadClick: () -> Unit,
     private val showTrackpadButton: Boolean,
     private val onWebRtcClick: () -> Unit,
+    private val onLocalPreviewToggleClick: () -> Unit,
     private val onCloseClick: () -> Unit
 ) : LinearLayout(context) {
 
@@ -55,6 +56,7 @@ class DisplayControlPanel(
     private val handleContainer: TextView
     private val buttonsContainer: LinearLayout
     private val divider: View
+    private lateinit var localPreviewButton: ImageView
 
     init {
         val panelSize = (40 * density).toInt()
@@ -244,7 +246,16 @@ class DisplayControlPanel(
         }
         buttonsContainer.addView(webRtcButton)
 
-        // 7. 分割线
+        // 8. 本机画面丢弃/恢复开关。这个开关与 WebRTC 启停独立：
+        //    眼睛 = 保留本机画面，眼睛关闭 = 停止本机解码并隐藏预览。
+        localPreviewButton = createControlButton(R.drawable.ic_visibility) {
+            onLocalPreviewToggleClick()
+        }.apply {
+            contentDescription = "本机画面：显示"
+        }
+        buttonsContainer.addView(localPreviewButton)
+
+        // 9. 分割线
         divider = View(context).apply {
             layoutParams = LayoutParams(
                 (20 * density).toInt(),
@@ -256,7 +267,7 @@ class DisplayControlPanel(
         }
         buttonsContainer.addView(divider)
 
-        // 8. 关闭退出按钮
+        // 10. 关闭退出按钮
         val closeButton = createControlButton(R.drawable.ic_close) {
             onCloseClick()
         }
@@ -326,6 +337,20 @@ class DisplayControlPanel(
                 this.y = (parent.height - selfHeight).coerceAtLeast(0f)
             }
         }
+    }
+
+    /**
+     * 更新眼睛按钮状态：
+     * false = 本机画面显示/本机解码开启
+     * true  = 本机画面丢弃/本机解码关闭
+     */
+    fun setLocalPreviewSuppressed(suppressed: Boolean) {
+        if (!::localPreviewButton.isInitialized) return
+        localPreviewButton.setImageResource(
+            if (suppressed) R.drawable.ic_visibility_off else R.drawable.ic_visibility
+        )
+        localPreviewButton.contentDescription =
+            if (suppressed) "本机画面：丢弃" else "本机画面：显示"
     }
 
     fun collapse() {

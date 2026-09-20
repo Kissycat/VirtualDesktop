@@ -33,13 +33,11 @@ class VideoStreamController(
     private var tracker: PerformanceTracker? = null
     private var pingJob: kotlinx.coroutines.Job? = null
     private val encodedVideoSinks = CopyOnWriteArraySet<EncodedVideoSink>()
+    // Persist the local-preview policy across decoder/codec recreation.
+    @Volatile private var localVideoDecodeEnabled = true
     @Volatile private var encodedWidth = 0
     @Volatile private var encodedHeight = 0
     @Volatile private var running = false
-
-    // Persist the local-decoder policy across H264StreamDecoder recreation.
-    // Surface/format changes must not silently restore local MediaCodec decoding.
-    @Volatile private var localVideoDecodeEnabled = true
 
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
     var onStreamEnded: ((reason: String) -> Unit)? = null
@@ -141,8 +139,10 @@ class VideoStreamController(
             }
             d.ultraLowLatency = settingsDataSource?.getUltraLowLatencySync()
                 ?: AppSettings.getUltraLowLatencySync()
-            encodedVideoSinks.forEach { d.addEncodedVideoSink(it) }
+            // New decoders inherit the current local-preview policy. Without
+            // this, a decoder recreation can silently resume local rendering.
             d.setLocalDecodeEnabled(localVideoDecodeEnabled)
+            encodedVideoSinks.forEach { d.addEncodedVideoSink(it) }
             surface?.let { d.setDisplaySurface(it) }
             d.start()
             decoder = d
