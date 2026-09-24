@@ -660,6 +660,7 @@ h1{margin:0 0 18px;font-size:22px}
 .row{display:flex;gap:10px;align-items:center;margin:12px 0}
 label{font-size:14px;color:#aaa;min-width:90px}
 input{flex:1;box-sizing:border-box;background:#111;color:#eee;border:1px solid #555;border-radius:6px;padding:10px 12px;font-size:15px}
+.portInput{flex:0 0 120px;width:120px}
 button{background:#333;color:#eee;border:1px solid #666;border-radius:6px;padding:9px 14px;cursor:pointer}
 button:hover{background:#444}
 #status{margin-top:16px;min-height:24px;color:#9ad;white-space:pre-wrap;word-break:break-word}
@@ -670,18 +671,20 @@ a{color:#9ad}
 <body>
 <div class="card">
 <h1>DLNA 投屏</h1>
-<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><button id="dlnaSearch">搜索设备</button></div>
+<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><input id="dlnaPort" class="portInput" placeholder="端口（可选）" inputmode="numeric" autocomplete="off"></div>
 <div id="deviceList" style="margin:8px 0 14px"></div>
 <div class="row">
+<button id="dlnaSearch">搜索设备</button>
 <button id="dlnaStart">开始投屏</button>
 <button id="dlnaStop">停止投屏</button>
 <a href="/">返回 WebRTC</a>
 </div>
 <div id="status">准备就绪</div>
-<div class="hint">可直接输入电视 IP，也可以点击“搜索设备”查看局域网内检测到的 DLNA 播放器候选。点击候选即可填入 IP；投屏链路及转码实现保持不变。</div>
+<div class="hint">可直接输入电视 IP，端口可选；也可以点击“搜索设备”查看局域网内检测到的 DLNA 播放器候选。候选会显示 UPnP 设备端口，同一 IP 的不同端口可以分别选择。</div>
 </div>
 <script>
 const ip=document.getElementById('dlnaIp');
+const port=document.getElementById('dlnaPort');
 const status=document.getElementById('status');
 const start=document.getElementById('dlnaStart');
 const stop=document.getElementById('dlnaStop');
@@ -698,8 +701,10 @@ function renderDevices(devices){
     const b=document.createElement('button');
     b.style.cssText='display:block;width:100%;text-align:left;margin:6px 0;padding:10px 12px;background:#181818;border:1px solid #444;border-radius:6px;color:#ddd;cursor:pointer';
     const title=d.friendlyName || d.modelName || 'DLNA Renderer';
-    b.textContent=title+'  ['+d.ip+']';
-    b.onclick=()=>{ip.value=d.ip;setStatus('已选择 '+title+' ('+d.ip+')');};
+    const port=(d.port&&Number(d.port)>0)?Number(d.port):null;
+    const endpoint=port?(d.ip+':'+port):d.ip;
+    b.textContent=title+'  ['+endpoint+']';
+    b.onclick=()=>{ip.value=d.ip;document.getElementById('dlnaPort').value=port?String(port):'';setStatus('已选择 '+title+' ('+endpoint+')');};
     deviceList.appendChild(b);
   }
 }
@@ -715,12 +720,20 @@ async function searchDevices(){
   }catch(e){setStatus('搜索失败：'+e.message)} finally{search.disabled=false;}
 }
 async function loadStatus(){
-  try{const r=await fetch('/dlna/status',{cache:'no-store'}); if(!r.ok)return; const x=await r.json(); if(x.target)ip.value=x.target; if(x.active)setStatus('投屏中\n'+x.url);}
-  catch(e){}
+  try{const r=await fetch('/dlna/status',{cache:'no-store'}); if(!r.ok)return; const x=await r.json();
+    if(x.target){
+      const m=String(x.target).match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?$/);
+      if(m){ip.value=m[1];port.value=m[2]||'';}else{ip.value=x.target;port.value='';}
+    }
+    if(x.active)setStatus('投屏中\n'+x.url);
+  } catch(e){}
 }
 search.onclick=searchDevices;
 start.onclick=async()=>{
-  const v=ip.value.trim(); if(!v){setStatus('请输入电视 IP');return;}
+  let v=ip.value.trim();
+  const p=port.value.trim();
+  if(!v){setStatus('请输入电视 IP');return;}
+  if(p && !v.includes(':')) v += ':'+p;
   setStatus('正在连接 '+v+' ...'); start.disabled=true;
   try{
     const r=await fetch('/dlna/cast',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:v})});
@@ -823,9 +836,11 @@ type h264Source struct {
 	audioLastError string
 
 	dlnaMu       sync.Mutex
+	dlnaOpMu     sync.Mutex
 	dlnaCancel   context.CancelFunc
 	dlnaTargetIP string
 	dlnaURL      string
+	dlnaRunID    uint64
 
 	// Raw-frame tile delta side channel. This is intentionally independent of
 	// the H264/DLNA paths: Android scrcpy supplies composed RGBA frames locally,
@@ -899,6 +914,10 @@ func main() {
 	source.audioEnabled = *flagAudio
 	log.Printf("[AUDIO-DIAG] client audio enabled=%t", source.audioEnabled)
 	go source.run()
+	// A gateway process can be killed/restarted while a TV is still receiving the
+	// previous live URL. Restore only an explicitly started cast whose last known
+	// activity is recent; an explicit Web UI Stop deletes this resume state.
+	go source.autoResumeDLNACast(30 * time.Second)
 	if source.audioEnabled {
 		go source.runAudio()
 	}
@@ -2174,7 +2193,7 @@ func (s *h264Source) openRoleSocket(role int) (net.Conn, error) {
 // ---- DLNA output (H.264 -> MPEG-TS over HTTP + UPnP AVTransport) ----
 
 type dlnaCastRequest struct {
-	IP string `json:"ip"`
+	IP string `json:"ip"` // IPv4, optionally with the renderer HTTP port: 10.0.0.5[:8008]
 }
 
 type dlnaStatus struct {
@@ -2182,6 +2201,11 @@ type dlnaStatus struct {
 	Target string `json:"target,omitempty"`
 	URL    string `json:"url,omitempty"`
 	Error  string `json:"error,omitempty"`
+}
+
+type dlnaResumeState struct {
+	Target       string `json:"target"`
+	LastActiveAt int64  `json:"lastActiveAtUnixNano"`
 }
 
 type upnpService struct {
@@ -2204,6 +2228,7 @@ type upnpDeviceDescription struct {
 
 type dlnaDiscoveredDevice struct {
 	IP           string `json:"ip"`
+	Port         int    `json:"port,omitempty"`
 	Location     string `json:"location,omitempty"`
 	FriendlyName string `json:"friendlyName,omitempty"`
 	ModelName    string `json:"modelName,omitempty"`
@@ -2233,6 +2258,8 @@ func discoverDLNADevices(timeout time.Duration) []dlnaDiscoveredDevice {
 		"ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
 	_, _ = conn.WriteToUDP([]byte(msg), &net.UDPAddr{IP: net.IPv4(239, 255, 255, 250), Port: 1900})
 
+	// Dedupe by renderer HTTP endpoint, not only by IP. Some TVs expose
+	// multiple independent DLNA renderers on the same address/host.
 	seen := make(map[string]bool)
 	var out []dlnaDiscoveredDevice
 	buf := make([]byte, 8192)
@@ -2248,17 +2275,26 @@ func discoverDLNADevices(timeout time.Duration) []dlnaDiscoveredDevice {
 		if ip == nil {
 			continue
 		}
-		ipstr := ip.String()
-		if seen[ipstr] {
-			continue
-		}
 		h := parseHTTPHeaders(buf[:n])
 		loc := strings.TrimSpace(h["location"])
 		if loc == "" {
 			continue
 		}
-		seen[ipstr] = true
-		d := dlnaDiscoveredDevice{IP: ipstr, Location: loc}
+		u, err := url.Parse(loc)
+		if err != nil || !strings.EqualFold(u.Scheme, "http") {
+			continue
+		}
+		host := ip.String()
+		port := 80
+		if p := u.Port(); p != "" {
+			port, _ = strconv.Atoi(p)
+		}
+		key := strings.ToLower(net.JoinHostPort(host, strconv.Itoa(port)))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		d := dlnaDiscoveredDevice{IP: host, Port: port, Location: loc}
 		if name, model := fetchDLNAFriendlyInfo(loc); name != "" || model != "" {
 			d.FriendlyName, d.ModelName = name, model
 		}
@@ -2304,23 +2340,24 @@ func handleDLNACast(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	ip := strings.TrimSpace(req.IP)
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil || parsedIP.To4() == nil {
-		http.Error(w, "invalid TV IPv4 address", http.StatusBadRequest)
+	host, port, hasPort, err := normalizeDLNATarget(req.IP)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if parsedIP.IsLoopback() || parsedIP.IsUnspecified() {
-		http.Error(w, "TV IP cannot be 127.0.0.1/localhost; enter the TV LAN IP", http.StatusBadRequest)
-		return
+	target := host
+	if hasPort {
+		target = net.JoinHostPort(host, strconv.Itoa(port))
 	}
-	ip = parsedIP.To4().String()
-	if err := src.startDLNACast(ip); err != nil {
+	// A manual Start replaces any old cast choice. If the new start fails, the
+	// old renderer must not unexpectedly come back on a later gateway restart.
+	_ = src.clearDLNAResumeState()
+	if err := src.startDLNACast(target); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "target": ip, "url": src.dlnaURLValue()})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "target": target, "url": src.dlnaURLValue()})
 }
 
 func handleDLNAStop(src *h264Source, w http.ResponseWriter, r *http.Request) {
@@ -2328,7 +2365,7 @@ func handleDLNAStop(src *h264Source, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	src.stopDLNACast()
+	src.stopDLNACast(true)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -2355,10 +2392,20 @@ func (s *h264Source) dlnaURLValue() string {
 	return s.dlnaURL
 }
 
-func (s *h264Source) startDLNACast(targetIP string) error {
-	s.stopDLNACast()
+func (s *h264Source) startDLNACast(target string) error {
+	s.dlnaOpMu.Lock()
+	defer s.dlnaOpMu.Unlock()
 
-	location, err := discoverDLNADevice(targetIP)
+	// Replacing an existing cast is not a manual stop, so keep the new target
+	// resumable after this process is restarted.
+	s.cancelDLNACast(false)
+
+	host, _, _, err := normalizeDLNATarget(target)
+	if err != nil {
+		return err
+	}
+
+	location, err := discoverDLNADevice(target)
 	if err != nil {
 		return err
 	}
@@ -2371,12 +2418,12 @@ func (s *h264Source) startDLNACast(targetIP string) error {
 	if parsed := net.ParseIP(gatewayIP); parsed != nil && parsed.To4() != nil && !parsed.IsLoopback() && !parsed.IsUnspecified() {
 		gatewayIP = parsed.To4().String()
 	} else {
-		gatewayIP = localIPFor(targetIP)
+		gatewayIP = localIPFor(host)
 	}
 	if gatewayIP == "" {
-		return fmt.Errorf("cannot determine gateway LAN IP for TV %s; set DLNA_PUBLIC_IP to the gateway LAN IPv4 address", targetIP)
+		return fmt.Errorf("cannot determine gateway LAN IP for TV %s; set DLNA_PUBLIC_IP to the gateway LAN IPv4 address", target)
 	}
-	log.Printf("DLNA gateway media address selected: %s (target=%s)", gatewayIP, targetIP)
+	log.Printf("DLNA gateway media address selected: %s (target=%s)", gatewayIP, target)
 	listenHost := os.Getenv("DLNA_LISTEN_HOST")
 	if listenHost == "" {
 		listenHost = "0.0.0.0"
@@ -2404,24 +2451,184 @@ func (s *h264Source) startDLNACast(targetIP string) error {
 
 	s.dlnaMu.Lock()
 	ctx, cancel := context.WithCancel(context.Background())
+	s.dlnaRunID++
+	runID := s.dlnaRunID
 	s.dlnaCancel = cancel
-	s.dlnaTargetIP = targetIP
+	s.dlnaTargetIP = target
 	s.dlnaURL = mediaURL
 	s.dlnaMu.Unlock()
-	_ = ctx
-	log.Printf("DLNA cast started: target=%s location=%s media=%s", targetIP, location, mediaURL)
+	if err := s.writeDLNAResumeState(target, time.Now()); err != nil {
+		log.Printf("DLNA resume state write failed: %v", err)
+	}
+	go s.dlnaResumeHeartbeat(ctx, runID, target)
+	log.Printf("DLNA cast started: target=%s location=%s media=%s", target, location, mediaURL)
 	return nil
 }
 
-func (s *h264Source) stopDLNACast() {
+// cancelDLNACast only tears down the in-process cast. It deliberately does not
+// modify the on-disk resume marker unless manual is true.
+func (s *h264Source) cancelDLNACast(manual bool) {
 	s.dlnaMu.Lock()
 	cancel := s.dlnaCancel
 	s.dlnaCancel = nil
 	s.dlnaTargetIP = ""
 	s.dlnaURL = ""
+	s.dlnaRunID++
 	s.dlnaMu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if manual {
+		if err := s.clearDLNAResumeState(); err != nil {
+			log.Printf("DLNA resume state clear failed: %v", err)
+		}
+	}
+}
+
+func (s *h264Source) stopDLNACast(manual bool) {
+	s.dlnaOpMu.Lock()
+	defer s.dlnaOpMu.Unlock()
+	s.cancelDLNACast(manual)
+}
+
+func normalizeDLNATarget(raw string) (host string, port int, hasPort bool, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", 0, false, fmt.Errorf("DLNA renderer address is empty")
+	}
+	if strings.Count(raw, ":") > 1 {
+		return "", 0, false, fmt.Errorf("invalid DLNA IPv4 address %q", raw)
+	}
+	host = raw
+	if strings.Count(raw, ":") == 1 {
+		parts := strings.SplitN(raw, ":", 2)
+		host = strings.TrimSpace(parts[0])
+		p, convErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if convErr != nil || p < 1 || p > 65535 {
+			return "", 0, false, fmt.Errorf("invalid DLNA renderer port in %q", raw)
+		}
+		port, hasPort = p, true
+	}
+	parsedIP := net.ParseIP(host)
+	if parsedIP == nil || parsedIP.To4() == nil {
+		return "", 0, false, fmt.Errorf("invalid TV IPv4 address %q", raw)
+	}
+	parsedIP = parsedIP.To4()
+	if parsedIP.IsLoopback() || parsedIP.IsUnspecified() {
+		return "", 0, false, fmt.Errorf("TV IP cannot be 127.0.0.1/localhost; enter the TV LAN IP")
+	}
+	host = parsedIP.String()
+	return host, port, hasPort, nil
+}
+
+func (s *h264Source) dlnaResumeStatePath() string {
+	if p := strings.TrimSpace(os.Getenv("DLNA_RESUME_FILE")); p != "" {
+		return p
+	}
+	return fmt.Sprintf("/data/local/tmp/virtualdisplay-dlna-resume-%d.json", s.displayID)
+}
+
+func (s *h264Source) writeDLNAResumeState(target string, now time.Time) error {
+	state := dlnaResumeState{Target: target, LastActiveAt: now.UnixNano()}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	path := s.dlnaResumeStatePath()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func (s *h264Source) clearDLNAResumeState() error {
+	path := s.dlnaResumeStatePath()
+	err := os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func (s *h264Source) readDLNAResumeState() (*dlnaResumeState, error) {
+	data, err := os.ReadFile(s.dlnaResumeStatePath())
+	if err != nil {
+		return nil, err
+	}
+	var state dlnaResumeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+	state.Target = strings.TrimSpace(state.Target)
+	if state.Target == "" || state.LastActiveAt <= 0 {
+		return nil, fmt.Errorf("invalid DLNA resume state")
+	}
+	return &state, nil
+}
+
+func (s *h264Source) autoResumeDLNACast(ttl time.Duration) {
+	state, err := s.readDLNAResumeState()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("DLNA resume state ignored: %v", err)
+		}
+		return
+	}
+	age := time.Since(time.Unix(0, state.LastActiveAt))
+	if age < 0 {
+		age = 0
+	}
+	if age > ttl {
+		_ = s.clearDLNAResumeState()
+		log.Printf("DLNA resume state expired: target=%s age=%s", state.Target, age.Round(time.Millisecond))
+		return
+	}
+
+	log.Printf("DLNA auto-resume candidate: target=%s age=%s", state.Target, age.Round(time.Millisecond))
+	// Let the Android scrcpy daemon/source settle for a moment, then retry a few
+	// times. Discovery is allowed to fail while the TV/network is waking up.
+	deadline := time.Now().Add(ttl - age)
+	for attempt := 1; time.Now().Before(deadline); attempt++ {
+		// A manual Stop clears the marker. Re-check it before every retry so a
+		// Stop pressed while this loop is sleeping can never be undone by auto-resume.
+		current, readErr := s.readDLNAResumeState()
+		if readErr != nil || current.Target != state.Target {
+			return
+		}
+		if err := s.startDLNACast(state.Target); err == nil {
+			log.Printf("DLNA auto-resume succeeded: target=%s attempt=%d", state.Target, attempt)
+			return
+		} else {
+			log.Printf("DLNA auto-resume attempt=%d failed: %v", attempt, err)
+		}
+		time.Sleep(1200 * time.Millisecond)
+	}
+	log.Printf("DLNA auto-resume window elapsed: target=%s", state.Target)
+}
+
+func (s *h264Source) dlnaResumeHeartbeat(ctx context.Context, runID uint64, target string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.dlnaMu.Lock()
+			active := s.dlnaCancel != nil && s.dlnaRunID == runID && s.dlnaTargetIP == target
+			s.dlnaMu.Unlock()
+			if !active {
+				return
+			}
+			if err := s.writeDLNAResumeState(target, now); err != nil {
+				log.Printf("DLNA resume heartbeat write failed: %v", err)
+			}
+		}
 	}
 }
 
@@ -2457,14 +2664,10 @@ func (s *h264Source) headerSnapshot() streamHeader {
 	return s.header
 }
 
-func discoverDLNADevice(targetIP string) (string, error) {
-	target := net.ParseIP(strings.TrimSpace(targetIP))
-	if target == nil || target.To4() == nil {
-		return "", fmt.Errorf("invalid renderer IP %q", targetIP)
-	}
-	targetIP = target.To4().String()
-	if target.IsLoopback() || target.IsUnspecified() {
-		return "", fmt.Errorf("invalid renderer IP %s: loopback/unspecified address is not a TV", targetIP)
+func discoverDLNADevice(target string) (string, error) {
+	host, port, hasPort, err := normalizeDLNATarget(target)
+	if err != nil {
+		return "", err
 	}
 
 	// 1) Best effort: send M-SEARCH directly to the requested renderer.
@@ -2475,36 +2678,39 @@ func discoverDLNADevice(targetIP string) (string, error) {
 		"urn:schemas-upnp-org:service:AVTransport:1",
 		"ssdp:all",
 	} {
-		if loc := ssdpSearchTarget(targetIP, targetIP, st, 2*time.Second); loc != "" {
+		if loc := ssdpSearchTarget(host, port, hasPort, host, st, 2*time.Second); loc != "" {
 			return loc, nil
 		}
 	}
 
 	// 2) Fall back to normal SSDP multicast, but only accept LOCATION URLs
-	// whose hostname matches the user-specified renderer IP.
-	if loc := ssdpSearchTarget(targetIP, "239.255.255.250", "urn:schemas-upnp-org:device:MediaRenderer:1", 2*time.Second); loc != "" {
+	// whose host (and optional explicitly selected port) matches the target.
+	if loc := ssdpSearchTarget(host, port, hasPort, "239.255.255.250", "urn:schemas-upnp-org:device:MediaRenderer:1", 2*time.Second); loc != "" {
 		return loc, nil
 	}
-	if loc := ssdpSearchTarget(targetIP, "239.255.255.250", "ssdp:all", 2*time.Second); loc != "" {
+	if loc := ssdpSearchTarget(host, port, hasPort, "239.255.255.250", "ssdp:all", 2*time.Second); loc != "" {
 		return loc, nil
 	}
 
 	// 3) Final fallback: many consumer TVs expose the UPnP root description
-	// without a discoverable SSDP response. Probe a small set of common HTTP
-	// ports/paths directly on the exact IP. The returned URL is then parsed for
-	// AVTransport exactly like a normal SSDP LOCATION.
-	for _, port := range []int{80, 8008, 8080, 8088, 8001, 8060, 9000, 9001, 49152, 49153, 5000, 52235, 7676, 3000, 7000} {
+	// without a discoverable SSDP response. When a renderer port was supplied,
+	// probe only that port so same-IP renderers can be explicitly selected.
+	ports := []int{80, 8008, 8080, 8088, 8001, 8060, 9000, 9001, 49152, 49153, 5000, 52235, 7676, 3000, 7000}
+	if hasPort {
+		ports = []int{port}
+	}
+	for _, p := range ports {
 		for _, path := range []string{"/description.xml", "/rootDesc.xml", "/dd.xml", "/DeviceDescription.xml", "/upnp/desc.xml", "/upnp/rootDesc.xml", "/xml/device_description.xml", "/etc/linuxigd/gatedesc.xml"} {
-			loc := fmt.Sprintf("http://%s:%d%s", targetIP, port, path)
+			loc := fmt.Sprintf("http://%s:%d%s", host, p, path)
 			if ok := probeUPnPDescription(loc); ok {
 				return loc, nil
 			}
 		}
 	}
-	return "", fmt.Errorf("DLNA renderer %s not reachable via targeted SSDP, multicast SSDP, or direct UPnP description probe", targetIP)
+	return "", fmt.Errorf("DLNA renderer %s not reachable via targeted SSDP, multicast SSDP, or direct UPnP description probe", target)
 }
 
-func ssdpSearchTarget(targetIP, destination, st string, timeout time.Duration) string {
+func ssdpSearchTarget(targetHost string, targetPort int, targetHasPort bool, destination, st string, timeout time.Duration) string {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return ""
@@ -2531,8 +2737,17 @@ func ssdpSearchTarget(targetIP, destination, st string, timeout time.Duration) s
 			continue
 		}
 		u, err := url.Parse(loc)
-		if err != nil || !strings.EqualFold(u.Hostname(), targetIP) {
+		if err != nil || !strings.EqualFold(u.Hostname(), targetHost) {
 			continue
+		}
+		if targetHasPort {
+			locationPort := 80
+			if p := u.Port(); p != "" {
+				locationPort, _ = strconv.Atoi(p)
+			}
+			if locationPort != targetPort {
+				continue
+			}
 		}
 		return loc
 	}
@@ -2758,7 +2973,7 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 	// DLNA client must NOT start from the oldest retained Opus packet, otherwise
 	// it can begin several seconds behind the first video keyframe. We seek the
 	// audio cursor to the frame whose receive timestamp is closest to the first
-	// video keyframe instead.	
+	// video keyframe instead.
 	var audioStartReceivedAt time.Time
 
 	for {

@@ -586,7 +586,10 @@ class DisplayActivity : ComponentActivity() {
             videoSurfaceView.visibility = if (suppressed) View.INVISIBLE else View.VISIBLE
         }
         if (::rootLayout.isInitialized) {
-            rootLayout.setBackgroundColor(if (suppressed) Color.BLACK else Color.TRANSPARENT)
+            // Keep the whole activity canvas opaque black at all times. The
+            // SurfaceView is fit-center sized, so the unused area around the
+            // video must never expose a transparent/underlying layer.
+            rootLayout.setBackgroundColor(Color.BLACK)
         }
         if (::controlPanel.isInitialized) {
             controlPanel.visibility = View.VISIBLE
