@@ -671,10 +671,9 @@ a{color:#9ad}
 <body>
 <div class="card">
 <h1>DLNA 投屏</h1>
-<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><input id="dlnaPort" class="portInput" placeholder="端口（可选）" inputmode="numeric" autocomplete="off"></div>
+<div class="row"><label for="dlnaIp">电视 IP</label><input id="dlnaIp" placeholder="例如 10.26.80.23" autocomplete="off"><input id="dlnaPort" class="portInput" placeholder="端口（可选）" inputmode="numeric" autocomplete="off"><button id="dlnaSearch">搜索设备</button></div>
 <div id="deviceList" style="margin:8px 0 14px"></div>
 <div class="row">
-<button id="dlnaSearch">搜索设备</button>
 <button id="dlnaStart">开始投屏</button>
 <button id="dlnaStop">停止投屏</button>
 <a href="/">返回 WebRTC</a>
@@ -2920,6 +2919,63 @@ func (s *h264Source) peekAudioFrame(after uint64) *audioFrame {
 	return nil
 }
 
+// latestAudioFrame returns the newest cached audio packet. A newly connected
+// DLNA client should start close to the live edge rather than replaying the
+// entire retained audio history.
+func (s *h264Source) latestAudioFrame() *audioFrame {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.audioHistory) == 0 {
+		return nil
+	}
+	return s.audioHistory[len(s.audioHistory)-1]
+}
+
+// seekVideoKeyframeNear finds the keyframe whose receive time is closest to
+// target. For a live DLNA stream this is preferable to always taking the first
+// retained keyframe, because it keeps audio and video on the same live edge.
+func (s *h264Source) seekVideoKeyframeNear(target time.Time) *h264Frame {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Prefer the newest keyframe at or before the audio target. Starting from a
+	// future keyframe would require pairing already-arrived audio with video from
+	// a later moment, which is another form of A/V content skew.
+	var previous *h264Frame
+	var next *h264Frame
+	for _, f := range s.history {
+		if f.flags&flagKeyFrame == 0 || f.receivedAt.IsZero() {
+			continue
+		}
+		if !f.receivedAt.After(target) {
+			previous = f
+			continue
+		}
+		next = f
+		break
+	}
+	if previous != nil {
+		return previous
+	}
+	return next
+}
+
+// latestVideoKeyFrame returns the newest retained keyframe. It is used when
+// audio is currently silent (and therefore may have no fresh packet at all),
+// so the video stream can still start immediately at the live edge.
+func (s *h264Source) latestVideoKeyFrame() *h264Frame {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for i := len(s.history) - 1; i >= 0; i-- {
+		if s.history[i].flags&flagKeyFrame != 0 {
+			return s.history[i]
+		}
+	}
+	return nil
+}
+
 // 5. 核心 HTTP 服务推流逻辑
 func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -2955,26 +3011,30 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// IMPORTANT: scrcpy video/audio PTS are not guaranteed to share the same
-	// origin. WebRTC deliberately normalizes video PTS, while ROLE_AUDIO exposes
-	// the source audio clock. Using the two raw PTS values to interleave or to
-	// start the TS program can put AAC hours away from the video timeline.
+	// origin. Also, the default Opus encoder can omit packets while the source
+	// is completely silent. A DLNA stream must therefore build one local program
+	// timeline and rebase audio whenever it first appears or resumes after a
+	// significant gap.
 	//
-	// Establish one local 90 kHz timeline. Keep the pacing of each source stream,
-	// but align their zero points by the arrival time of the first cached
-	// video/audio frames.
+	// Start from the LIVE EDGE: choose the newest audio packet and the video
+	// keyframe nearest its receive time. This avoids the old failure mode where
+	// a client connected during silence waited for the first audio packet and
+	// then replayed several seconds of stale video before the audio.
 	var videoBasePtsUs int64 = -1
 	var audioBasePtsUs int64 = -1
-	var audioOffsetUs int64
+	var audioClockOffsetUs int64
 	timelineReady := false
 	var lastWrittenVideoPts uint64
 	var lastWrittenAudioPts uint64
 
-	// The audio history is intentionally buffered for WebRTC reconnects. A new
-	// DLNA client must NOT start from the oldest retained Opus packet, otherwise
-	// it can begin several seconds behind the first video keyframe. We seek the
-	// audio cursor to the frame whose receive timestamp is closest to the first
-	// video keyframe instead.
-	var audioStartReceivedAt time.Time
+	// Track the input audio clock independently from the AAC encoder output.
+	// This lets us detect hard-silence gaps even when the transcoder itself
+	// temporarily buffers one AAC frame.
+	var previousAudioReceivedAt time.Time
+	var previousAudioPtsUs int64
+	const audioGapRebase = 300 * time.Millisecond
+	const audioPtsJumpRebase = 300 * time.Millisecond
+	const freshAudioWindow = 500 * time.Millisecond
 
 	for {
 		vf := s.peekVideoFrame(lastVideoSeq)
@@ -2995,75 +3055,76 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Do not put audio before the first video keyframe. But once the first
-		// video frame is available, establish both stream bases from the same
-		// cached-history snapshot and retain the audio/video pacing thereafter.
+		// Build the video timeline immediately from the live edge. Audio is
+		// optional at this point because a hard-silent Opus encoder may emit no
+		// packets for an arbitrarily long time. When fresh audio appears later,
+		// it is anchored to the already-running video clock.
 		if !timelineReady {
-			if vf == nil || vf.flags&flagKeyFrame == 0 {
+			latestAudio := s.latestAudioFrame()
+			freshAudio := latestAudio != nil && !latestAudio.receivedAt.IsZero() && time.Since(latestAudio.receivedAt) <= freshAudioWindow
+
+			anchorVideo := s.latestVideoKeyFrame()
+			if freshAudio {
+				if near := s.seekVideoKeyframeNear(latestAudio.receivedAt); near != nil {
+					anchorVideo = near
+				}
+			}
+			if anchorVideo == nil {
 				time.Sleep(2 * time.Millisecond)
 				continue
 			}
-
-			// Re-seek audio once, using receive time rather than source PTS. This
-			// removes the accumulated history backlog from the DLNA start point.
-			if audioStartReceivedAt.IsZero() {
-				if vf.receivedAt.IsZero() {
-					time.Sleep(2 * time.Millisecond)
-					continue
-				}
-				s.mu.RLock()
-				var nearest *audioFrame
-				var nearestDelta time.Duration
-				for _, candidate := range s.audioHistory {
-					if candidate.receivedAt.IsZero() {
-						continue
-					}
-					d := candidate.receivedAt.Sub(vf.receivedAt)
-					if d < 0 {
-						d = -d
-					}
-					if nearest == nil || d < nearestDelta {
-						nearest = candidate
-						nearestDelta = d
-					}
-				}
-				s.mu.RUnlock()
-
-				if nearest == nil {
-					time.Sleep(2 * time.Millisecond)
-					continue
-				}
-				// peekAudioFrame(after) returns seq > after, so seq-1 makes
-				// 'nearest' the first audio frame emitted by this client.
-				if nearest.seq > 0 {
-					lastAudioSeq = nearest.seq - 1
-				}
-				audioStartReceivedAt = nearest.receivedAt
-				log.Printf("[DLNA-AUDIO] start seek videoRecv=%s audioRecv=%s backlog=%s audioSeq=%d",
-					vf.receivedAt.Format(time.RFC3339Nano), nearest.receivedAt.Format(time.RFC3339Nano),
-					nearest.receivedAt.Sub(vf.receivedAt), nearest.seq)
+			if anchorVideo.seq > 0 {
+				lastVideoSeq = anchorVideo.seq - 1
 			}
 
-			af = s.peekAudioFrame(lastAudioSeq)
-			if af == nil {
-				time.Sleep(2 * time.Millisecond)
-				continue
-			}
-
-			videoBasePtsUs = vf.ptsUs
-			audioBasePtsUs = af.ptsUs
-			// Fine-tune the local audio clock from receive-time skew. Positive
-			// skew means the audio packet arrived later and therefore needs to
-			// start slightly earlier on the common timeline, not later.
-			if !vf.receivedAt.IsZero() && !af.receivedAt.IsZero() {
-				audioOffsetUs = -af.receivedAt.Sub(vf.receivedAt).Microseconds()
-			}
-			if audioOffsetUs < -500_000 || audioOffsetUs > 500_000 {
-				audioOffsetUs = 0
-			}
+			videoBasePtsUs = anchorVideo.ptsUs
 			timelineReady = true
-			log.Printf("[DLNA-AUDIO] timeline aligned videoPTS=%d audioPTS=%d audioOffset=%dus",
-				videoBasePtsUs, audioBasePtsUs, audioOffsetUs)
+
+			if freshAudio {
+				if latestAudio.seq > 0 {
+					lastAudioSeq = latestAudio.seq - 1
+				}
+			} else if latestAudio != nil {
+				// Skip stale packets retained from before a silent period. The next
+				// packet will be the first real audio after silence.
+				lastAudioSeq = latestAudio.seq
+			}
+
+			// Refresh both cursors after changing their sequence anchors. In
+			// particular, do not accidentally emit a stale audio packet kept from
+			// before a silent interval.
+			vf = s.peekVideoFrame(lastVideoSeq)
+			af = s.peekAudioFrame(lastAudioSeq)
+			if freshAudio && af != nil {
+				audioBasePtsUs = af.ptsUs
+				audioClockOffsetUs = af.receivedAt.Sub(anchorVideo.receivedAt).Microseconds()
+			}
+
+			if audioClockOffsetUs < -2_000_000 || audioClockOffsetUs > 2_000_000 {
+				audioClockOffsetUs = 0
+			}
+			log.Printf("[DLNA-AUDIO] live-edge video timeline videoPTS=%d videoSeq=%d audioReady=%t audioSeq=%d audioAge=%s",
+				videoBasePtsUs, anchorVideo.seq, audioBasePtsUs >= 0, lastAudioSeq, func() time.Duration {
+					if latestAudio == nil || latestAudio.receivedAt.IsZero() {
+						return 0
+					}
+					return time.Since(latestAudio.receivedAt)
+				}())
+		}
+
+		// First audio after an initial silent period: anchor it exactly to the
+		// current video timeline instead of to the stale source PTS origin.
+		if af != nil && audioBasePtsUs < 0 {
+			audioBasePtsUs = af.ptsUs
+			targetUs := int64(lastWrittenVideoPts) * 1000 / 90
+			if vf != nil {
+				if candidate := vf.ptsUs - videoBasePtsUs; candidate > targetUs {
+					targetUs = candidate
+				}
+			}
+			audioClockOffsetUs = targetUs
+			log.Printf("[DLNA-AUDIO] first audio after silence anchored pts=%d targetVideoUs=%d audioOffset=%dus",
+				af.ptsUs, targetUs, audioClockOffsetUs)
 		}
 
 		writeVideo := false
@@ -3076,14 +3137,15 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 				vLocalUs = 0
 			}
 		}
-		if af != nil {
-			aLocalUs = af.ptsUs - audioBasePtsUs + audioOffsetUs
+		if af != nil && audioBasePtsUs >= 0 {
+			aLocalUs = af.ptsUs - audioBasePtsUs + audioClockOffsetUs
 			if aLocalUs < 0 {
 				aLocalUs = 0
 			}
 		}
 
-		if vf != nil && af != nil {
+		audioReady := af != nil && audioBasePtsUs >= 0
+		if vf != nil && audioReady {
 			if vLocalUs <= aLocalUs {
 				writeVideo = true
 			} else {
@@ -3091,7 +3153,7 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if vf != nil {
 			writeVideo = true
-		} else if af != nil {
+		} else if audioReady {
 			writeAudio = true
 		}
 
@@ -3119,6 +3181,38 @@ func (s *h264Source) serveDLNAStream(w http.ResponseWriter, r *http.Request) {
 			lastWrittenVideoPts = pts90k
 			lastVideoSeq = vf.seq
 		} else if writeAudio {
+			// Hard-silence Opus encoders may stop producing packets. When audio
+			// resumes, its source PTS can be many hundreds of milliseconds ahead
+			// of the already-running video timeline. Rebase only on a real gap or
+			// a large PTS discontinuity; do not continuously rewrite audio PTS,
+			// otherwise normal clock drift would turn into audible jitter.
+			if !previousAudioReceivedAt.IsZero() && !af.receivedAt.IsZero() {
+				recvGap := af.receivedAt.Sub(previousAudioReceivedAt)
+				ptsGap := af.ptsUs - previousAudioPtsUs
+				ptsGapErr := ptsGap - recvGap.Microseconds()
+				if recvGap >= audioGapRebase || ptsGapErr > audioPtsJumpRebase.Microseconds() || ptsGapErr < -audioPtsJumpRebase.Microseconds() {
+					rawLocalUs := af.ptsUs - audioBasePtsUs + audioClockOffsetUs
+					targetUs := int64(lastWrittenVideoPts) * 1000 / 90
+					if vf != nil && vLocalUs > targetUs {
+						targetUs = vLocalUs
+					}
+					if targetUs < 0 {
+						targetUs = 0
+					}
+					audioClockOffsetUs += targetUs - rawLocalUs
+					log.Printf("[DLNA-AUDIO] timeline rebase after gap=%s ptsGap=%dus videoUs=%d audioOffset=%dus",
+						recvGap.Round(time.Millisecond), ptsGap, targetUs, audioClockOffsetUs)
+					aLocalUs = af.ptsUs - audioBasePtsUs + audioClockOffsetUs
+					if aLocalUs < 0 {
+						aLocalUs = 0
+					}
+				}
+			}
+			if !af.receivedAt.IsZero() {
+				previousAudioReceivedAt = af.receivedAt
+			}
+			previousAudioPtsUs = af.ptsUs
+
 			var aacData []byte
 			if transcoder != nil {
 				aacData = transcoder.Transcode(af.data)
