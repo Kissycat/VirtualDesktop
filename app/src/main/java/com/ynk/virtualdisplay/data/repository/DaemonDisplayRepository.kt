@@ -488,6 +488,12 @@ class DaemonDisplayRepository(
         )
     }
 
+    override fun notifyVideoUserActivity(displayId: Int) {
+        if (currentStreamingDisplayId == displayId) {
+            videoController.resumeFromUserActivity()
+        }
+    }
+
     override suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit> {
         // 调整尺寸 → Remote DataSource
         val result = remoteDataSource.resizeDisplay(displayId, width, height, dpi)

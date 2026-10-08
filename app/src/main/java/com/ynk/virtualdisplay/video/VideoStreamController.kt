@@ -8,8 +8,10 @@ import com.ynk.virtualdisplay.data.AppSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.CopyOnWriteArraySet
 import kotlinx.coroutines.withContext
@@ -32,6 +34,11 @@ class VideoStreamController(
     private var decoder: H264StreamDecoder? = null
     private var tracker: PerformanceTracker? = null
     private var pingJob: kotlinx.coroutines.Job? = null
+    private var idlePolicyJob: Job? = null
+    private val idlePolicyMutex = Mutex()
+    private val lastUserActivityMs = java.util.concurrent.atomic.AtomicLong(0L)
+    private val idleFreezeArmed = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var currentDisplayId = -1
     private val encodedVideoSinks = CopyOnWriteArraySet<EncodedVideoSink>()
     // Persist the local-preview policy across decoder/codec recreation.
     @Volatile private var localVideoDecodeEnabled = true
@@ -61,6 +68,9 @@ class VideoStreamController(
 
     suspend fun start(displayId: Int, surface: Surface?, w: Int, h: Int): Result<Unit> = mutex.withLock {
         running = false
+        currentDisplayId = displayId
+        lastUserActivityMs.set(android.os.SystemClock.elapsedRealtime())
+        idleFreezeArmed.set(false)
         Log.i(TAG, "Starting video stream for display $displayId... (surface=$surface valid=${surface?.isValid} dims=${w}x${h})")
 
         // 1. 先关闭残留 Scrcpy 子通道 (视频 + 控制)：关闭旧 video socket 会使 decoder
@@ -157,6 +167,7 @@ class VideoStreamController(
         Log.i(TAG, "VideoStreamController started successfully for display $displayId (surface bound=${surface != null && surface.isValid})")
         
         startPingLoop()
+        startIdlePolicyLoop(displayId)
         Result.success(Unit)
     }
 
@@ -186,6 +197,17 @@ class VideoStreamController(
         Log.i(TAG, "Stopping video stream...")
         pingJob?.cancel()
         pingJob = null
+        idlePolicyJob?.cancel()
+        idlePolicyJob = null
+        val oldDisplayId = currentDisplayId
+        currentDisplayId = -1
+        if (idleFreezeArmed.compareAndSet(true, false) && oldDisplayId >= 0) {
+            try {
+                idlePolicyMutex.withLock { controlApi.setIdleFreezeMonitoring(oldDisplayId, false) }
+            } catch (t: Throwable) {
+                Log.d(TAG, "Failed to clear idle monitoring during stop", t)
+            }
+        }
         // Post-b7aef962: stopVideoStream (210) removed. Video server stops
         // automatically when the ROLE_VIDEO socket closes. 先断开 Scrcpy 子信道使
         // input worker 阻塞的 read() 抛 SocketException 退出，从而下面的
@@ -207,8 +229,69 @@ class VideoStreamController(
 
     /** Toggle only local MediaCodec decoding. Does not reconnect or modify any socket. */
     fun setLocalVideoDecodeEnabled(enabled: Boolean) {
+        if (localVideoDecodeEnabled == enabled) {
+            if (enabled) resumeFromUserActivity()
+            return
+        }
         localVideoDecodeEnabled = enabled
         decoder?.setLocalDecodeEnabled(enabled)
+        if (enabled) {
+            // Re-enabling the local preview is itself an explicit user-visible
+            // activity. Do not leave the server encoder frozen while the user
+            // waits for the next raw-change sample.
+            resumeFromUserActivity()
+        }
+    }
+
+    /** Called from the UI thread for every user input event. It only updates an
+     * atomic timestamp; network/RPC work happens only when the idle state actually
+     * changes. */
+    fun notifyUserActivity() {
+        lastUserActivityMs.set(android.os.SystemClock.elapsedRealtime())
+    }
+
+    private fun startIdlePolicyLoop(displayId: Int) {
+        idlePolicyJob?.cancel()
+        idlePolicyJob = scope.launch(Dispatchers.IO) {
+            while (isActive && running && currentDisplayId == displayId) {
+                val idleFor = android.os.SystemClock.elapsedRealtime() - lastUserActivityMs.get()
+                if (idleFor >= 2_500L) {
+                    if (idleFreezeArmed.compareAndSet(false, true)) {
+                        val result = idlePolicyMutex.withLock {
+                            // Re-check after waiting for any concurrent resume request.
+                            val stillIdle = android.os.SystemClock.elapsedRealtime() - lastUserActivityMs.get() >= 2_500L
+                            if (stillIdle && running && currentDisplayId == displayId) {
+                                controlApi.setIdleFreezeMonitoring(displayId, true)
+                            } else {
+                                Result.success(Unit)
+                            }
+                        }
+                        if (result.isFailure) {
+                            idleFreezeArmed.compareAndSet(true, false)
+                        }
+                    }
+                    delay(1_000L)
+                } else {
+                    delay((2_500L - idleFor).coerceIn(50L, 1_000L))
+                }
+            }
+        }
+    }
+
+    fun resumeFromUserActivity() {
+        lastUserActivityMs.set(android.os.SystemClock.elapsedRealtime())
+        if (idleFreezeArmed.compareAndSet(true, false)) {
+            val displayId = currentDisplayId
+            if (displayId >= 0) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        idlePolicyMutex.withLock { controlApi.setIdleFreezeMonitoring(displayId, false) }
+                    } catch (t: Throwable) {
+                        Log.d(TAG, "Failed to resume video after user activity", t)
+                    }
+                }
+            }
+        }
     }
 
     fun updateResolution(w: Int, h: Int) {

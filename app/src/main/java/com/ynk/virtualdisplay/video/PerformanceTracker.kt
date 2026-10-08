@@ -43,8 +43,10 @@ class PerformanceTracker {
     @Volatile private var queueLatencyEwmaMs: Double = 0.0
     private val frameReceiveTimeNsByPtsUs = ConcurrentHashMap<Long, Long>()
 
-    /** 周期性上报格式化统计字符串的回调。 */
-    var onPerformanceStats: ((String) -> Unit)? = null
+    /** 周期性上报格式化统计字符串的回调。Null = diagnostics disabled. */
+    @Volatile var onPerformanceStats: ((String) -> Unit)? = null
+
+    fun isDiagnosticsEnabled(): Boolean = onPerformanceStats != null
 
     private fun updateEwma(current: Double, sample: Double, alpha: Double = 0.2): Double =
         if (current == 0.0) sample else (current * (1.0 - alpha)) + (sample * alpha)
@@ -55,6 +57,7 @@ class PerformanceTracker {
      * @param rttMs 往返时延（毫秒）。
      */
     fun recordRtt(rttMs: Double) {
+        if (!isDiagnosticsEnabled()) return
         rttEwmaMs = updateEwma(rttEwmaMs, rttMs, 0.1)
         // 以 RTT 一半估算网络延迟
         networkLatencyMs = rttEwmaMs / 2.0
@@ -66,6 +69,7 @@ class PerformanceTracker {
      * @param ptsUs 帧的呈现时间戳（微秒）。
      */
     fun recordFrameReceived(ptsUs: Long) {
+        if (!isDiagnosticsEnabled()) return
         frameReceiveTimeNsByPtsUs[ptsUs] = System.nanoTime()
     }
 
@@ -75,6 +79,7 @@ class PerformanceTracker {
      * @param ptsUs 帧的呈现时间戳（微秒）。
      */
     fun recordEnqueue(ptsUs: Long) {
+        if (!isDiagnosticsEnabled()) return
         inputEnqueueNsByPtsUs[ptsUs] = System.nanoTime()
         val receiveNs = frameReceiveTimeNsByPtsUs.get(ptsUs)
         if (receiveNs != null) {
@@ -89,6 +94,7 @@ class PerformanceTracker {
      * @param ptsUs 帧的呈现时间戳（微秒）。
      */
     fun recordDecode(ptsUs: Long) {
+        if (!isDiagnosticsEnabled()) return
         val enqueueNs = inputEnqueueNsByPtsUs.remove(ptsUs)
         frameReceiveTimeNsByPtsUs.remove(ptsUs) // cleanup
         if (enqueueNs != null) {
@@ -103,6 +109,7 @@ class PerformanceTracker {
      * @param dequeuedAtNs 该帧从 codec 输出队列取出的纳秒时间。
      */
     fun recordRender(dequeuedAtNs: Long) {
+        if (!isDiagnosticsEnabled()) return
         val nowNs = System.nanoTime()
         val renderLatencyMs = (nowNs - dequeuedAtNs) / 1_000_000.0
         renderLatencyEwmaMs = updateEwma(renderLatencyEwmaMs, renderLatencyMs)
@@ -131,6 +138,7 @@ class PerformanceTracker {
      * @param bytes 本次接收的字节数。
      */
     fun recordReceived(bytes: Int) {
+        if (!isDiagnosticsEnabled()) return
         val nowMs = System.currentTimeMillis()
         if (windowStartMs == 0L) {
             windowStartMs = nowMs
@@ -149,6 +157,7 @@ class PerformanceTracker {
 
     /** 递增丢弃帧计数（渲染队列溢出或停止时丢弃的输出帧）。 */
     fun incrementDroppedFrames() {
+        if (!isDiagnosticsEnabled()) return
         droppedOutputFrames.incrementAndGet()
     }
 
@@ -204,6 +213,7 @@ class PerformanceTracker {
      * no diagnostic signal.
      */
     fun pushStatsIfStale() {
+        if (!isDiagnosticsEnabled()) return
         val nowMs = System.currentTimeMillis()
         if (nowMs - (renderWindowStartMs.takeIf { it > 0 } ?: nowMs) >= 1000) {
             onPerformanceStats?.invoke(getStatsString())

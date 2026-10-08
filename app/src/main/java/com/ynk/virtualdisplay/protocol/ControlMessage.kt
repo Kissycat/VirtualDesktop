@@ -160,6 +160,17 @@ sealed class ControlMessage {
         override fun encode(sequence: Long): ByteArray = buildMessage(type, sequence) {}
     }
 
+    data class SetIdleFreezeMonitoring(
+        val displayId: Int,
+        val enabled: Boolean,
+    ) : ControlMessage() {
+        override val type: Int = TYPE_SET_IDLE_FREEZE_MONITORING
+        override fun encode(sequence: Long): ByteArray = buildMessage(type, sequence) {
+            writeInt(displayId)
+            writeByte(if (enabled) 1 else 0)
+        }
+    }
+
     protected fun buildMessage(type: Int, sequence: Long, block: DataOutputStream.() -> Unit): ByteArray {
         val baos = ByteArrayOutputStream()
         DataOutputStream(baos).use { dos ->
@@ -196,6 +207,7 @@ sealed class ControlMessage {
         const val TYPE_LAUNCH_HOME = 217
         const val TYPE_LIST_APPS = 218
         const val TYPE_PING = 219
+        const val TYPE_SET_IDLE_FREEZE_MONITORING = 220
     }
 }
 

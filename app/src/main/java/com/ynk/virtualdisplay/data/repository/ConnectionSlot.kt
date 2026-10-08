@@ -430,6 +430,12 @@ class ConnectionSlot(
             .fold({ Result.success(Unit) }, { Result.failure(it) })
     }
 
+    override fun notifyVideoUserActivity(displayId: Int) {
+        if (currentStreamingDisplayId == displayId) {
+            videoController.resumeFromUserActivity()
+        }
+    }
+
     override suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit> {
         val result = remoteDataSource.resizeDisplay(displayId, width, height, dpi)
         result.onSuccess {

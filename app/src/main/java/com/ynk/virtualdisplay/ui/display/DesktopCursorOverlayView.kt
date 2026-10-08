@@ -33,6 +33,7 @@ class DesktopCursorOverlayView @JvmOverloads constructor(
     private val path = Path()
 
     private var targetView: VideoSurfaceView? = null
+    private val cursorChangedListener: () -> Unit = { postInvalidateOnAnimation() }
 
     init {
         setWillNotDraw(false)
@@ -45,6 +46,17 @@ class DesktopCursorOverlayView @JvmOverloads constructor(
     fun attachToVideoView(view: VideoSurfaceView) {
         targetView = view
         invalidate()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        DesktopCursorState.addChangeListener(cursorChangedListener)
+        postInvalidateOnAnimation()
+    }
+
+    override fun onDetachedFromWindow() {
+        DesktopCursorState.removeChangeListener(cursorChangedListener)
+        super.onDetachedFromWindow()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -82,9 +94,6 @@ class DesktopCursorOverlayView @JvmOverloads constructor(
 
         canvas.drawPath(path, strokePaint)
         canvas.drawPath(path, fillPaint)
-
-        // Keep the cursor responsive even when no touch event occurs.
-        postInvalidateOnAnimation()
     }
 
     override fun onTouchEvent(event: android.view.MotionEvent): Boolean {

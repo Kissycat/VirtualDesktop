@@ -1,5 +1,6 @@
 package com.ynk.virtualdisplay.ui.display
 
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -27,31 +28,60 @@ object DesktopCursorState {
     private val width = AtomicInteger(1920)
     private val height = AtomicInteger(1080)
     private val dpi = AtomicInteger(160)
+    private val changeListeners = CopyOnWriteArraySet<() -> Unit>()
+
+    fun addChangeListener(listener: () -> Unit) {
+        changeListeners.add(listener)
+    }
+
+    fun removeChangeListener(listener: () -> Unit) {
+        changeListeners.remove(listener)
+    }
+
+    private fun notifyChanged() {
+        changeListeners.forEach { listener ->
+            runCatching { listener() }
+        }
+    }
 
     fun reset(w: Int = 1920, h: Int = 1080, displayDpi: Int = 160) {
         val safeW = w.coerceAtLeast(1)
         val safeH = h.coerceAtLeast(1)
+        val newX = safeW / 2
+        val newY = safeH / 2
+        val newDpi = displayDpi.coerceAtLeast(1)
+        val changed = width.get() != safeW || height.get() != safeH ||
+            dpi.get() != newDpi || x.get() != newX || y.get() != newY || !visible.get()
         width.set(safeW)
         height.set(safeH)
-        dpi.set(displayDpi.coerceAtLeast(1))
-        x.set(safeW / 2)
-        y.set(safeH / 2)
+        dpi.set(newDpi)
+        x.set(newX)
+        y.set(newY)
         visible.set(true)
+        if (changed) notifyChanged()
     }
 
     fun update(cursorX: Float, cursorY: Float, w: Int, h: Int, displayDpi: Int = dpi.get()) {
         val safeW = w.coerceAtLeast(1)
         val safeH = h.coerceAtLeast(1)
+        val newDpi = displayDpi.coerceAtLeast(1)
+        val newX = cursorX.coerceIn(0f, safeW.toFloat()).toInt()
+        val newY = cursorY.coerceIn(0f, safeH.toFloat()).toInt()
+        val changed = width.get() != safeW || height.get() != safeH ||
+            dpi.get() != newDpi || x.get() != newX || y.get() != newY || !visible.get()
         width.set(safeW)
         height.set(safeH)
-        dpi.set(displayDpi.coerceAtLeast(1))
-        x.set(cursorX.coerceIn(0f, safeW.toFloat()).toInt())
-        y.set(cursorY.coerceIn(0f, safeH.toFloat()).toInt())
+        dpi.set(newDpi)
+        x.set(newX)
+        y.set(newY)
         visible.set(true)
+        if (changed) notifyChanged()
     }
 
     fun hide() {
-        visible.set(false)
+        if (visible.getAndSet(false)) {
+            notifyChanged()
+        }
     }
 
     fun snapshot(): Snapshot = Snapshot(

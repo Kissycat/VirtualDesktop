@@ -74,6 +74,9 @@ interface IDisplayRepository {
     /** Enable/disable local video decoding without reconnecting video/control sockets. */
     suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> = Result.success(Unit)
 
+    /** Notify the active video stream that the user interacted with the UI. */
+    fun notifyVideoUserActivity(displayId: Int) {}
+
     /** 重新调整指定虚拟显示器的物理尺寸和 DPI */
     suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit>
 

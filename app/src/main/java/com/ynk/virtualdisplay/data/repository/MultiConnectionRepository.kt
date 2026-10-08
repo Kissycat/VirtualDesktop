@@ -136,6 +136,10 @@ class MultiConnectionRepository(
     override suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> =
         activeSlot?.setLocalVideoDecodeEnabled(displayId, enabled) ?: Result.failure(noActiveSlotError())
 
+    override fun notifyVideoUserActivity(displayId: Int) {
+        activeSlot?.notifyVideoUserActivity(displayId)
+    }
+
     override suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit> =
         activeSlot?.resizeDisplay(displayId, width, height, dpi) ?: Result.failure(noActiveSlotError())
 

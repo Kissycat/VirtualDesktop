@@ -189,6 +189,14 @@ class DisplayActivity : ComponentActivity() {
     private val interactor: com.ynk.virtualdisplay.domain.DisplayInteractor by inject()
     private val displayMetricsManager: DisplayMetricsManager by inject()
     private val gatewayProcessController: GatewayProcessController by inject()
+
+    private val performanceStatsCallback: (String) -> Unit = { stats ->
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            if (::statsOverlay.isInitialized) {
+                statsOverlay.text = stats
+            }
+        }
+    }
     
     private val repository: IDisplayRepository by lazy {
         val key = nodeKey
@@ -285,13 +293,9 @@ class DisplayActivity : ComponentActivity() {
         startDisconnectDetection(displayId)
         startWebRtcMonitor()
 
-        repository.setPerformanceStatsCallback { stats ->
-            lifecycleScope.launch(Dispatchers.Main) {
-                if (::statsOverlay.isInitialized) {
-                    statsOverlay.text = stats
-                }
-            }
-        }
+        // Diagnostics are opt-in. When the overlay is hidden, the decoder no
+        // longer maintains per-frame latency maps just for invisible UI.
+        applyStatsOverlayVisibility()
 
         repository.setVideoConfigCallback { width, height ->
             lifecycleScope.launch(Dispatchers.Main) {
@@ -579,6 +583,7 @@ class DisplayActivity : ComponentActivity() {
         val shouldShow = AppSettings.showPerformanceStatsCache.value &&
             !shouldHideLocalPreview(gatewayProcessController.isRunning())
         statsOverlay.visibility = if (shouldShow) View.VISIBLE else View.GONE
+        repository.setPerformanceStatsCallback(if (shouldShow) performanceStatsCallback else null)
     }
 
     private fun applyLocalPreviewUi(suppressed: Boolean) {
@@ -599,8 +604,7 @@ class DisplayActivity : ComponentActivity() {
         // The diagnostics switch in Settings remains authoritative across all
         // WebRTC/trackpad/desktop-mode transitions.
         if (::statsOverlay.isInitialized) {
-            val shouldShow = AppSettings.showPerformanceStatsCache.value && !suppressed
-            statsOverlay.visibility = if (shouldShow) View.VISIBLE else View.GONE
+            applyStatsOverlayVisibility()
         }
     }
 
@@ -1006,6 +1010,13 @@ class DisplayActivity : ComponentActivity() {
      * original rootLayout touch listener and touchscreen injection path.
      */
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        // Every real user touch/hover event also wakes the server-side video
+        // pipeline immediately. This is deliberately done before the mode
+        // branches below so normal touchscreen mode gets the same no-freeze
+        // grace period as desktop/trackpad mode. The repository call is
+        // non-blocking; it only records activity and schedules the RPC off the UI thread.
+        remoteDisplayId?.let { repository.notifyVideoUserActivity(it) }
+
         // The single-input entry point is also used by normal mode when the
         // explicit Touchpad switch is enabled. Pure touchscreen mode delegates
         // to the original view hierarchy unchanged.
@@ -1190,6 +1201,8 @@ class DisplayActivity : ComponentActivity() {
 
     @SuppressLint("RestrictedApi", "GestureBackNavigation")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        remoteDisplayId?.let { repository.notifyVideoUserActivity(it) }
+
         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
             if (AppSettings.captureBackCache.value) {
                 if (event.action == KeyEvent.ACTION_UP) {
