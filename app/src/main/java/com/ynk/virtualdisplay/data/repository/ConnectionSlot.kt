@@ -1,5 +1,7 @@
 package com.ynk.virtualdisplay.data.repository
 
+import com.ynk.virtualdisplay.MyApplication
+
 import android.content.Context
 import android.util.Log
 import android.view.InputEvent
@@ -118,6 +120,8 @@ class ConnectionSlot(
                 val maxRemoteAttempts = if (node.isLocal) Int.MAX_VALUE else 5
 
                 while (isBound) {
+                    MyApplication.awaitPhysicalDisplayForeground()
+                    if (!isBound) break
                     attempt++
                     val delayMs = (baseDelayMs * (1L shl (attempt - 1))).coerceAtMost(maxDelayMs)
                     _connectionStatus.value = ConnectionStatus.RECONNECTING

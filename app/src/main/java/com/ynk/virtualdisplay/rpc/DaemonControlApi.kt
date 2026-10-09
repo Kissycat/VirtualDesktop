@@ -321,8 +321,15 @@ class DaemonControlApiImpl(
         val msg = ControlMessage.SetIdleFreezeMonitoring(displayId, enabled)
         val resp = rpc.sendAndAwait(msg) ?: return Result.failure(IOException("Connection error or timeout"))
         return if (resp is DeviceMessage.GenericResponse) {
-            if (resp.statusCode == 0) Result.success(Unit)
-            else Result.failure(IllegalStateException(resp.message ?: "Failed code: ${resp.statusCode}"))
+            if (resp.statusCode == 0) {
+                if (enabled && resp.message == "INPUT_GRACE_ACTIVE") {
+                    Result.failure(IllegalStateException("INPUT_GRACE_ACTIVE"))
+                } else {
+                    Result.success(Unit)
+                }
+            } else {
+                Result.failure(IllegalStateException(resp.message ?: "Failed code: ${resp.statusCode}"))
+            }
         } else {
             Result.failure(IllegalStateException("Unexpected response type: $resp"))
         }

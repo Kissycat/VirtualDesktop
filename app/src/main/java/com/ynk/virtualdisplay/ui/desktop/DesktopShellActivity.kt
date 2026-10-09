@@ -44,6 +44,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
+import com.ynk.virtualdisplay.MyApplication
 import com.ynk.virtualdisplay.domain.DisplayInteractor
 import com.ynk.virtualdisplay.webrtc.GatewayProcessController
 import com.ynk.virtualdisplay.ui.display.DisplayActivity
@@ -455,6 +456,8 @@ class DesktopShellActivity : ComponentActivity() {
             val delayToNextMinute = 60_000L - (now % 60_000L)
             delay(delayToNextMinute.coerceIn(250L, 60_000L))
             while (isActive && !isFinishing && !isDestroyed) {
+                MyApplication.awaitPhysicalDisplayForeground()
+                if (!isActive || isFinishing || isDestroyed) break
                 dockClock?.text = currentDockClockText()
                 delay(60_000L)
             }
@@ -1106,6 +1109,8 @@ class DesktopShellActivity : ComponentActivity() {
         taskbarMonitorJob = lifecycleScope.launch {
             delay(2000)
             while (isActive && (desktopWindowFocused || dockOverlayVisible) && !isFinishing && !isDestroyed) {
+                MyApplication.awaitPhysicalDisplayForeground()
+                if (!isActive || isFinishing || isDestroyed) break
                 if (dockOverlayVisible || (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
                     window.decorView.hasWindowFocus())) {
                     refreshTaskbar(allowWhenUnfocused = dockOverlayVisible)

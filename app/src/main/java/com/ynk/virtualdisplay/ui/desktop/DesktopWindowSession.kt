@@ -224,6 +224,15 @@ internal class DesktopWindowSession(
             if (!started || id < 0) {
                 return@withLock Result.failure(IllegalStateException("Desktop window session is not started"))
             }
+            // Unlike fullscreen input, desktop-window input bypasses ConnectionSlot.
+            // Update this window's own VideoStreamController before writing to ROLE_CONTROL;
+            // otherwise its idle loop can still believe no input occurred and arm a freeze
+            // immediately after a click (particularly when the parent Activity is on a
+            // non-physical display). ACTION_CANCEL is a framework cancellation, not input.
+            if (event !is android.view.MotionEvent ||
+                event.actionMasked != android.view.MotionEvent.ACTION_CANCEL) {
+                video.notifyUserActivity()
+            }
             Log.d(TAG, "injectInput display=$id type=${event.javaClass.simpleName} action=${(event as? android.view.MotionEvent)?.actionMasked ?: (event as? android.view.KeyEvent)?.action} source=${event.source} size=${width}x${height}")
             val result = controlApi.injectInput(id, event, width, height)
             Log.d(TAG, "injectInputResult display=$id success=${result.isSuccess} value=${result.getOrNull()} error=${result.exceptionOrNull()?.message}")
@@ -237,6 +246,7 @@ internal class DesktopWindowSession(
             if (!started || id < 0) {
                 return@withLock Result.failure(IllegalStateException("Desktop window session is not started"))
             }
+            video.notifyUserActivity()
             controlApi.injectInput(id, event, 0, 0)
         }
     }
@@ -247,6 +257,7 @@ internal class DesktopWindowSession(
             if (!started || id < 0) {
                 return@withLock Result.failure(IllegalStateException("Desktop window session is not started"))
             }
+            video.notifyUserActivity()
             val downTime = SystemClock.uptimeMillis()
             val down = KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0)
             val up = KeyEvent(downTime, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, keyCode, 0)
@@ -270,6 +281,7 @@ internal class DesktopWindowSession(
             if (!started || id < 0) {
                 return@withLock Result.failure(IllegalStateException("Desktop window session is not started"))
             }
+            video.notifyUserActivity()
             val props = arrayOf(android.view.MotionEvent.PointerProperties().apply {
                 this.id = -1
                 toolType = android.view.MotionEvent.TOOL_TYPE_MOUSE
@@ -308,6 +320,9 @@ internal class DesktopWindowSession(
             if (!started || id < 0) {
                 return@withLock Result.failure(IllegalStateException("Desktop window session is not started"))
             }
+            // Hover/move/button events for this floating window must refresh the same
+            // input clock used by its idle-policy worker, just like fullscreen input.
+            video.notifyUserActivity()
             controlApi.injectMouseEvent(id, action, pointerId, x, y, width, height, actionButton, buttons)
         }
     }

@@ -31,6 +31,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.ynk.virtualdisplay.R
+import com.ynk.virtualdisplay.MyApplication
 import com.ynk.virtualdisplay.data.AppSettings
 import com.ynk.virtualdisplay.data.model.AppInfo
 import com.ynk.virtualdisplay.data.repository.IDisplayRepository
@@ -306,7 +307,10 @@ class DisplayActivity : ComponentActivity() {
 
     override fun onDestroy() {
         desktopWebRtcMonitorJob?.cancel()
-        runCatching { gatewayProcessController.stop() }
+        // The gateway is an independent privileged process and intentionally
+        // survives Activity/Surface recreation and switching the APP to background.
+        // It is stopped only by the explicit WebRTC stop control, never as a side
+        // effect of Activity destruction.
         super.onDestroy()
         backCallback.remove()
         repository.setPerformanceStatsCallback(null)
@@ -495,6 +499,8 @@ class DisplayActivity : ComponentActivity() {
         desktopWebRtcMonitorJob?.cancel()
         desktopWebRtcMonitorJob = lifecycleScope.launch(Dispatchers.IO) {
             while (!isFinishing && !isDestroyed) {
+                MyApplication.awaitPhysicalDisplayForeground()
+                if (isFinishing || isDestroyed) break
                 val running = gatewayProcessController.isRunning()
                 val stickySuppressed = isFloatingWebRtcLocalPreviewSuppressed()
                 val displayId = remoteDisplayId
@@ -874,8 +880,18 @@ class DisplayActivity : ComponentActivity() {
                 if (status == com.ynk.virtualdisplay.data.repository.ConnectionStatus.DISCONNECTED ||
                     status == com.ynk.virtualdisplay.data.repository.ConnectionStatus.ERROR
                 ) {
-                    Log.w(TAG, "Connection status=$status, finishing activity")
-                    finish()
+                    // Do not destroy the controller Activity while the app is hidden on
+                    // physical display 0. Wait without polling, then re-check the latest
+                    // state in case the reconnect completed while we were suspended.
+                    MyApplication.awaitPhysicalDisplayForeground()
+                    if (isFinishing || isDestroyed) return@collect
+                    val latest = repository.connectionStatus.value
+                    if (latest == com.ynk.virtualdisplay.data.repository.ConnectionStatus.DISCONNECTED ||
+                        latest == com.ynk.virtualdisplay.data.repository.ConnectionStatus.ERROR
+                    ) {
+                        Log.w(TAG, "Connection status=$latest, finishing activity")
+                        finish()
+                    }
                 }
             }
         }
@@ -884,8 +900,13 @@ class DisplayActivity : ComponentActivity() {
         if (!isLocalNode) {
             remoteDisplayMonitorJob = lifecycleScope.launch(Dispatchers.IO) {
                 while (!isFinishing) {
+                    MyApplication.awaitPhysicalDisplayForeground()
+                    if (isFinishing) break
                     kotlinx.coroutines.delay(15_000)
                     if (isFinishing) break
+                    if (!MyApplication.isPhysicalDisplayForeground &&
+                        !GatewayProcessController.isGatewayRunningKnown()
+                    ) continue
                     val result = repository.getActiveDisplayInfos()
                     val stillExists = result.getOrNull()?.any { it.displayId == displayId } ?: true
                     if (!stillExists) {
@@ -936,7 +957,10 @@ class DisplayActivity : ComponentActivity() {
                 resizeJob?.cancel()
                 resizeJob = lifecycleScope.launch {
                     kotlinx.coroutines.delay(250)
-                    repository.resizeDisplay(remoteDisplayId!!, width, height, dpi)
+                    MyApplication.awaitPhysicalDisplayForeground()
+                    if (!isFinishing && !isDestroyed) {
+                        repository.resizeDisplay(remoteDisplayId!!, width, height, dpi)
+                    }
                 }
             } else {
                 Log.i(TAG, "applyDisplayDimensions: first discovery, skipping resize (display already created with correct dimensions)")
@@ -1010,16 +1034,9 @@ class DisplayActivity : ComponentActivity() {
      * original rootLayout touch listener and touchscreen injection path.
      */
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        // Every real user touch/hover event also wakes the server-side video
-        // pipeline immediately. This is deliberately done before the mode
-        // branches below so normal touchscreen mode gets the same no-freeze
-        // grace period as desktop/trackpad mode. The repository call is
-        // non-blocking; it only records activity and schedules the RPC off the UI thread.
-        remoteDisplayId?.let { repository.notifyVideoUserActivity(it) }
-
-        // The single-input entry point is also used by normal mode when the
-        // explicit Touchpad switch is enabled. Pure touchscreen mode delegates
-        // to the original view hierarchy unchanged.
+        // Pure touchscreen mode delegates to the original view hierarchy. Its
+        // idle wake-up is handled later only when the event is routed to the
+        // actual remote video area by handleTouchEvent().
         if (!desktopMode && !trackpadEnabled) {
             return super.dispatchTouchEvent(event)
         }
@@ -1028,8 +1045,19 @@ class DisplayActivity : ComponentActivity() {
             isPointInsideView(event.rawX, event.rawY, controlPanel)
 
         if (inControlPanel) {
-            // Let the actual floating buttons receive their normal click events.
+            // Local control-panel clicks are not input to the virtual display;
+            // they must not cancel its idle policy. Visual changes caused by a
+            // button action are detected by the server-side frame monitor.
             return super.dispatchTouchEvent(event)
+        }
+
+        // Desktop/touchpad mode sends touches outside the local control panel
+        // through the virtual-display input controller. Only this routed input
+        // counts as activity; no app-wide/physical-screen touch signal is used.
+        if (::inputController.isInitialized && inputController.hasVideoSize() &&
+            event.actionMasked != MotionEvent.ACTION_CANCEL &&
+            event.actionMasked != MotionEvent.ACTION_OUTSIDE) {
+            remoteDisplayId?.let { repository.notifyVideoUserActivity(it) }
         }
 
         // Four-finger gestures are a desktop-only command layer. Once the
@@ -1151,15 +1179,36 @@ class DisplayActivity : ComponentActivity() {
 
     @SuppressLint("RestrictedApi")
     private fun handleTouchEvent(event: MotionEvent): Boolean {
+        // A non-clickable gap/padding inside the local control-panel container can
+        // fall through to the root touch listener. Keep it local instead of treating
+        // it as a gesture on the virtual-display input surface.
+        if (::controlPanel.isInitialized &&
+            isPointInsideView(event.rawX, event.rawY, controlPanel)) {
+            return false
+        }
+
         if (desktopMode || trackpadEnabled) {
             // Desktop mode is always a trackpad surface. Normal mode enters the
             // same path only when the user enables the explicit touchpad switch.
             // Never fall through to the legacy touchscreen path in either case.
+            if (inputController.hasVideoSize()) {
+                remoteDisplayId?.let { repository.notifyVideoUserActivity(it) }
+            }
             return inputController.handleTrackpadEvent(rootLayout, event)
         }
 
-        val shouldHandleRemotely = (inputController.shouldHandleRemotely(event)) &&
-            (isInsideVideoArea(event) || event.actionMasked == MotionEvent.ACTION_DOWN)
+        val insideVideoArea = isInsideVideoArea(event)
+        val shouldHandleRemotely = inputController.shouldHandleRemotely(event) &&
+            (insideVideoArea || event.actionMasked == MotionEvent.ACTION_DOWN)
+
+        // Only actual pointer events on the displayed video content can end
+        // idle. Touches on letterbox bars, local controls, or unrelated app
+        // windows never reach this notification path.
+        if (shouldHandleRemotely && insideVideoArea &&
+            event.actionMasked != MotionEvent.ACTION_CANCEL &&
+            event.actionMasked != MotionEvent.ACTION_OUTSIDE) {
+            remoteDisplayId?.let { repository.notifyVideoUserActivity(it) }
+        }
 
         val handled = if (shouldHandleRemotely) {
             inputController.handleMotionEvent(rootLayout, event)

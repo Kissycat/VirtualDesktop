@@ -47,6 +47,9 @@ class H264StreamDecoder(
     private val codecLock = Any()
 
     var onVideoConfig: ((codecLabel: String, width: Int, height: Int) -> Unit)? = null
+    /** Called once when a decoded frame has actually been submitted to the real display Surface. */
+    var onFirstFrameRendered: (() -> Unit)? = null
+    private val firstFrameRenderedReported = AtomicBoolean(false)
     /** Called when the remote video socket reaches EOF/error without an explicit stop(). */
     var onStreamEnded: ((reason: String) -> Unit)? = null
     var ultraLowLatency: Boolean = false
@@ -76,6 +79,14 @@ class H264StreamDecoder(
     init {
         tracker.actualWidth = width
         tracker.actualHeight = height
+    }
+
+    private fun reportFirstFrameRendered() {
+        if (targetSurface?.isValid != true || isUsingDummySurface) return
+        if (firstFrameRenderedReported.compareAndSet(false, true)) {
+            runCatching { onFirstFrameRendered?.invoke() }
+                .onFailure { Log.w(TAG, "First-frame callback failed", it) }
+        }
     }
 
     private fun getDummySurface(): Surface {
@@ -401,8 +412,13 @@ class H264StreamDecoder(
                             if (localDecodeEnabled && targetSurface != null && !isUsingDummySurface) {
                                 framesRendered++
                                 if (ultraLowLatency) {
-                                    runCatching { activeCodec.releaseOutputBuffer(outputIndex, System.nanoTime()) }
-                                    tracker.recordRender(dequeuedAtNs)
+                                    val rendered = runCatching {
+                                        activeCodec.releaseOutputBuffer(outputIndex, System.nanoTime())
+                                    }.isSuccess
+                                    if (rendered) {
+                                        tracker.recordRender(dequeuedAtNs)
+                                        reportFirstFrameRendered()
+                                    }
                                 } else {
                                     renderScheduler?.offer(
                                         DecodedOutputFrame(
@@ -656,14 +672,15 @@ class H264StreamDecoder(
                 }
                 try {
                     if (render) {
-                        runCatching {
+                        val rendered = runCatching {
                             activeCodec.releaseOutputBuffer(frame.bufferIndex, frameTimeNanos)
-                        }.getOrElse {
-                            runCatching {
-                                activeCodec.releaseOutputBuffer(frame.bufferIndex, true)
-                            }
+                        }.isSuccess || runCatching {
+                            activeCodec.releaseOutputBuffer(frame.bufferIndex, true)
+                        }.isSuccess
+                        if (rendered) {
+                            tracker.recordRender(frame.dequeuedAtNs)
+                            reportFirstFrameRendered()
                         }
-                        tracker.recordRender(frame.dequeuedAtNs)
                     } else {
                         runCatching {
                             activeCodec.releaseOutputBuffer(frame.bufferIndex, false)

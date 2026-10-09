@@ -12,6 +12,17 @@ import java.net.Socket
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import com.ynk.virtualdisplay.MyApplication
 
 /**
  * Starts the bundled WebRTC gateway through Shizuku/root from /data/local/tmp.
@@ -33,6 +44,88 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         private const val PID_PATH = "/data/local/tmp/virtualdisplay-webrtc-gateway.pid"
         private const val START_TIMEOUT_MS = 10_000L
         private const val PROBE_TIMEOUT_MS = 300
+
+        /** Shared process state used by background-quiescence policy across all video controllers. */
+        private val _gatewayRunningFlow = MutableStateFlow(false)
+        val gatewayRunningFlow: StateFlow<Boolean> = _gatewayRunningFlow.asStateFlow()
+
+        @Volatile
+        private var gatewayRunningKnown = false
+        private val backgroundStateMonitorScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        private val backgroundStateMonitorLock = Any()
+        @Volatile
+        private var backgroundStateMonitorJob: Job? = null
+
+        fun isGatewayRunningKnown(): Boolean = gatewayRunningKnown
+
+        private fun publishGatewayRunningState(running: Boolean) {
+            val changed = gatewayRunningKnown != running
+            gatewayRunningKnown = running
+            _gatewayRunningFlow.value = running
+            if (running && !MyApplication.isPhysicalDisplayForeground) {
+                if (changed || backgroundStateMonitorJob?.isActive != true) {
+                    startBackgroundStateMonitor()
+                }
+            } else if (!running && (changed || backgroundStateMonitorJob != null)) {
+                stopBackgroundStateMonitor()
+            }
+        }
+
+        /** Stop probing once the APP returns to display 0; foreground monitors resume then. */
+        fun onPhysicalDisplayForegroundChanged(foreground: Boolean) {
+            if (foreground) {
+                stopBackgroundStateMonitor()
+            } else if (gatewayRunningKnown) {
+                startBackgroundStateMonitor()
+            }
+        }
+
+        private fun startBackgroundStateMonitor() {
+            if (MyApplication.isPhysicalDisplayForeground || !gatewayRunningKnown) return
+            synchronized(backgroundStateMonitorLock) {
+                if (backgroundStateMonitorJob?.isActive == true) return
+                backgroundStateMonitorJob = backgroundStateMonitorScope.launch {
+                    // While GO is active, keep the app in its normal mode and watch
+                    // for an independent stop (e.g. `pkill`/external management).
+                    // The watch exists only while GO is known alive and terminates as
+                    // soon as the port closes; no timer remains when GO is stopped.
+                    while (isActive) {
+                        delay(1_500L)
+                        if (MyApplication.isPhysicalDisplayForeground || !gatewayRunningKnown) break
+                        val stillListening = isLocalPortOpen(DEFAULT_GATEWAY_PORT, PROBE_TIMEOUT_MS)
+                        publishGatewayRunningState(stillListening)
+                        if (!stillListening) break
+                    }
+                }
+            }
+        }
+
+        private fun stopBackgroundStateMonitor() {
+            synchronized(backgroundStateMonitorLock) {
+                backgroundStateMonitorJob?.cancel()
+                backgroundStateMonitorJob = null
+            }
+        }
+
+        /**
+         * Low-cost liveness check for lifecycle transitions. The gateway binds its
+         * HTTP/WebRTC listener on localhost even when launched independently of the APP.
+         * Probe once on entering background. A lightweight 1.5-second watcher exists
+         * only while GO is known active so an external GO shutdown re-enables quiescence;
+         * it terminates as soon as the port closes.
+         */
+        fun refreshGatewayRunningFromLocalPort(): Boolean {
+            val running = isLocalPortOpen(DEFAULT_GATEWAY_PORT, PROBE_TIMEOUT_MS)
+            publishGatewayRunningState(running)
+            return running
+        }
+
+        private fun isLocalPortOpen(port: Int, timeoutMs: Int): Boolean = try {
+            Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), timeoutMs) }
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     @Volatile private var pid: Int = -1
@@ -41,8 +134,10 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         // The gateway is a privileged process. Determine its lifecycle from the
         // privileged PID/process table first, and use the localhost TCP probe only
         // as a fallback. This keeps the UI state independent from the app's UID.
-        return runCatching { remoteGatewayProcessAlive() }.getOrDefault(false) ||
+        val running = runCatching { remoteGatewayProcessAlive() }.getOrDefault(false) ||
             isPortOpen(DEFAULT_GATEWAY_PORT)
+        publishGatewayRunningState(running)
+        return running
     }
 
     /** Starts the bundled gateway and makes it consume the existing scrcpy daemon stream. */
@@ -125,6 +220,10 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
                 )
             }
 
+            publishGatewayRunningState(
+                isPortOpen(DEFAULT_GATEWAY_PORT) ||
+                    (gatewayPort == DEFAULT_GATEWAY_PORT && runCatching { remoteGatewayProcessAlive() }.getOrDefault(false))
+            )
             browserUrl(gatewayPort)
         }
     }
@@ -137,6 +236,9 @@ class GatewayProcessController(private val context: Context) : AutoCloseable {
         runCatching {
             runPrivilegedShell("rm -f $REMOTE_PATH $LOG_PATH $PID_PATH")
         }
+        val stillRunning = runCatching { remoteGatewayProcessAlive() }.getOrDefault(false) ||
+            isPortOpen(DEFAULT_GATEWAY_PORT)
+        publishGatewayRunningState(stillRunning)
     }
 
     private fun installBinary() {

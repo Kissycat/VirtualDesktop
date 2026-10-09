@@ -12,9 +12,20 @@ import com.ynk.virtualdisplay.data.AppSettings
 import com.ynk.virtualdisplay.di.appModule
 import com.ynk.virtualdisplay.di.coreModule
 import com.ynk.virtualdisplay.util.ExceptionUtils
+import com.ynk.virtualdisplay.webrtc.GatewayProcessController
 import org.koin.android.ext.koin.androidContext
 import org.koin.core.context.startKoin
 import java.util.IdentityHashMap
+import java.util.concurrent.CopyOnWriteArraySet
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * VirtualDisplay 应用入口，采用单阶段冷启动。
@@ -36,6 +47,32 @@ class MyApplication : Application() {
         /** Backward-compatible alias; intentionally reflects the physical display only. */
         val isAppInForeground: Boolean
             get() = isPhysicalDisplayForeground
+
+        private val _physicalDisplayForegroundFlow = MutableStateFlow(false)
+        val physicalDisplayForegroundFlow: StateFlow<Boolean> = _physicalDisplayForegroundFlow.asStateFlow()
+        private val physicalForegroundListeners = CopyOnWriteArraySet<(Boolean) -> Unit>()
+
+        /** Register a lightweight state-change callback. Callbacks must not perform blocking work. */
+        fun addPhysicalDisplayForegroundListener(listener: (Boolean) -> Unit) {
+            physicalForegroundListeners.add(listener)
+            runCatching { listener(isPhysicalDisplayForeground) }
+        }
+
+        fun removePhysicalDisplayForegroundListener(listener: (Boolean) -> Unit) {
+            physicalForegroundListeners.remove(listener)
+        }
+
+        /**
+         * Suspends without polling while both the physical UI is backgrounded and
+         * the independent GO gateway is stopped. When GO is running, existing APP
+         * monitoring/reconnect behavior is intentionally kept alive as before.
+         */
+        suspend fun awaitPhysicalDisplayForeground() {
+            if (isPhysicalDisplayForeground || GatewayProcessController.isGatewayRunningKnown()) return
+            combine(physicalDisplayForegroundFlow, GatewayProcessController.gatewayRunningFlow) { foreground, gatewayRunning ->
+                foreground || gatewayRunning
+            }.first { it }
+        }
     }
 
     private class ActivityFocusState {
@@ -49,6 +86,7 @@ class MyApplication : Application() {
 
     private val activityLifecycleLock = Any()
     private val activityStates = IdentityHashMap<Activity, ActivityFocusState>()
+    private val gatewayLifecycleProbeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Resolve the actual display hosting the Activity. Do not fall back to a
@@ -75,10 +113,25 @@ class MyApplication : Application() {
         val newForeground = activityStates.values.any { state ->
             state.displayId == Display.DEFAULT_DISPLAY && state.resumed && state.hasWindowFocus
         }
-        if (isPhysicalDisplayForeground != newForeground) {
-            Log.d(TAG, "Physical-display foreground changed: $isPhysicalDisplayForeground -> $newForeground")
-        }
+        val changed = isPhysicalDisplayForeground != newForeground
+        if (!changed) return
+        Log.d(TAG, "Physical-display foreground changed: $isPhysicalDisplayForeground -> $newForeground")
         isPhysicalDisplayForeground = newForeground
+        _physicalDisplayForegroundFlow.value = newForeground
+        GatewayProcessController.onPhysicalDisplayForegroundChanged(newForeground)
+        physicalForegroundListeners.forEach { listener ->
+            runCatching { listener(newForeground) }
+        }
+        if (!newForeground) {
+            // Check once when the physical UI leaves foreground. This catches a GO
+            // gateway launched independently through ADB/Shizuku even if no video
+            // controller is currently active to perform the transition probe.
+            // When GO is absent this is the only extra probe; there is no background
+            // timer keeping the APP awake just to ask whether GO has appeared.
+            gatewayLifecycleProbeScope.launch {
+                GatewayProcessController.refreshGatewayRunningFromLocalPort()
+            }
+        }
     }
 
     private fun updateActivityState(

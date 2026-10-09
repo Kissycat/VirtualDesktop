@@ -13,7 +13,6 @@ import java.net.Socket
 import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.LinkedBlockingDeque
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -54,7 +53,6 @@ class WebRtcH264TcpEndpoint(
         // standing latency. At 60 fps this is ~400 ms; at 120 fps ~200 ms.
         private const val DEFAULT_QUEUE_CAPACITY = 24
         private const val SOCKET_BACKLOG = 8
-        private const val ACCEPT_READ_TIMEOUT_MS = 1000
         private const val SOCKET_SEND_BUFFER_BYTES = 1024 * 1024
     }
 
@@ -77,6 +75,7 @@ class WebRtcH264TcpEndpoint(
     ) : AutoCloseable {
 
         private val queue = LinkedBlockingDeque<FramePacket>(queueCapacity.coerceAtLeast(8))
+        private val wakePacket = FramePacket(ByteArray(0))
         @Volatile private var pendingConfig: FramePacket? = initialConfig
         @Volatile private var pendingKey: FramePacket? = initialKey
         @Volatile private var awaitingKeyFrame: Boolean = initialKey == null
@@ -105,6 +104,7 @@ class WebRtcH264TcpEndpoint(
                 pendingKey = null
                 queue.clear()
                 awaitingKeyFrame = true
+                queue.offerLast(wakePacket)
                 return
             }
 
@@ -114,6 +114,7 @@ class WebRtcH264TcpEndpoint(
                 queue.clear()
                 pendingKey = packet
                 awaitingKeyFrame = false
+                queue.offerLast(wakePacket)
                 return
             }
 
@@ -179,11 +180,13 @@ class WebRtcH264TcpEndpoint(
                         continue
                     }
 
-                    val packet = queue.pollFirst(100, java.util.concurrent.TimeUnit.MILLISECONDS)
-                    if (packet != null) {
-                        data.write(packet.bytes)
-                        data.flush()
-                    }
+                    // Blocking take avoids periodic 100ms wake-ups when no frames arrive.
+                    // CONFIG/IDR changes enqueue a zero-byte wake packet so pending* is
+                    // consumed immediately without serializing a fake wire packet.
+                    val packet = queue.takeFirst()
+                    if (packet.bytes.isEmpty()) continue
+                    data.write(packet.bytes)
+                    data.flush()
                 }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -224,7 +227,7 @@ class WebRtcH264TcpEndpoint(
             require(clientQueueCapacity >= 2) { "clientQueueCapacity must be >= 2" }
 
             val server = ServerSocket(port, SOCKET_BACKLOG, InetAddress.getByName(bindHost)).apply {
-                soTimeout = ACCEPT_READ_TIMEOUT_MS
+                // accept() blocks until a client arrives or close() is called; no timeout polling.
                 reuseAddress = true
             }
             serverSocket = server
@@ -268,8 +271,8 @@ class WebRtcH264TcpEndpoint(
             // away from the decoder/UI threads.
             runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_MORE_FAVORABLE) }
             while (running.get() && !Thread.currentThread().isInterrupted) {
-                val frame = rawFrameQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
-                processRawFrame(frame)
+                // No timed polling: when idle, wait until an encoded frame is enqueued.
+                processRawFrame(rawFrameQueue.take())
             }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
