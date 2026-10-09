@@ -1,6 +1,7 @@
 package com.ynk.virtualdisplay.video
 
 import android.util.Log
+import com.ynk.virtualdisplay.MyApplication
 import android.view.Surface
 import com.ynk.virtualdisplay.net.DaemonTransport
 import com.ynk.virtualdisplay.data.local.AppSettingsDataSource
@@ -243,26 +244,40 @@ class VideoStreamController(
         }
     }
 
-    /** Called from the UI thread for every user input event. It only updates an
-     * atomic timestamp; network/RPC work happens only when the idle state actually
-     * changes. */
+    /** Called for UI input. Touch activity matters only while the app is foreground;
+     * RPC work is scheduled only when the server-side idle-monitor state changes. */
     fun notifyUserActivity() {
-        lastUserActivityMs.set(android.os.SystemClock.elapsedRealtime())
+        // Input should only postpone idle detection while an Activity on physical
+        // display 0 is both resumed and window-focused. Input received by a virtual
+        // display or stale/injected input while another physical app owns focus must
+        // never wake the server encoder.
+        if (!MyApplication.isPhysicalDisplayForeground) return
+        resumeFromUserActivity(requirePhysicalForeground = true)
     }
 
     private fun startIdlePolicyLoop(displayId: Int) {
         idlePolicyJob?.cancel()
         idlePolicyJob = scope.launch(Dispatchers.IO) {
             while (isActive && running && currentDisplayId == displayId) {
+                val appInForeground = MyApplication.isPhysicalDisplayForeground
                 val idleFor = android.os.SystemClock.elapsedRealtime() - lastUserActivityMs.get()
-                if (idleFor >= 2_500L) {
+                // Foreground: protect active interaction for 2.5 seconds.
+                // Background: ignore touch timestamps and start low-rate raw-frame
+                // comparison immediately, even if the last touch was recent.
+                if (!appInForeground || idleFor >= 2_500L) {
                     if (idleFreezeArmed.compareAndSet(false, true)) {
                         val result = idlePolicyMutex.withLock {
                             // Re-check after waiting for any concurrent resume request.
-                            val stillIdle = android.os.SystemClock.elapsedRealtime() - lastUserActivityMs.get() >= 2_500L
-                            if (stillIdle && running && currentDisplayId == displayId) {
+                            val stillForegroundIdle = MyApplication.isPhysicalDisplayForeground &&
+                                android.os.SystemClock.elapsedRealtime() - lastUserActivityMs.get() < 2_500L
+                            val shouldMonitor = !stillForegroundIdle && running && currentDisplayId == displayId
+                            if (shouldMonitor) {
                                 controlApi.setIdleFreezeMonitoring(displayId, true)
                             } else {
+                                // The foreground/touch state may have changed while waiting
+                                // for the mutex. Clear the optimistic armed flag so the loop
+                                // can retry at the next eligible idle boundary.
+                                idleFreezeArmed.compareAndSet(true, false)
                                 Result.success(Unit)
                             }
                         }
@@ -272,21 +287,51 @@ class VideoStreamController(
                     }
                     delay(1_000L)
                 } else {
-                    delay((2_500L - idleFor).coerceIn(50L, 1_000L))
+                    // Poll foreground changes promptly so moving the app to the
+                    // background takes effect without waiting out the touch grace period.
+                    delay((2_500L - idleFor).coerceIn(50L, 250L))
                 }
             }
         }
     }
 
-    fun resumeFromUserActivity() {
+    fun resumeFromUserActivity() = resumeFromUserActivity(requirePhysicalForeground = false)
+
+    private fun resumeFromUserActivity(requirePhysicalForeground: Boolean) {
+        if (requirePhysicalForeground && !MyApplication.isPhysicalDisplayForeground) return
         lastUserActivityMs.set(android.os.SystemClock.elapsedRealtime())
         if (idleFreezeArmed.compareAndSet(true, false)) {
             val displayId = currentDisplayId
             if (displayId >= 0) {
                 scope.launch(Dispatchers.IO) {
                     try {
-                        idlePolicyMutex.withLock { controlApi.setIdleFreezeMonitoring(displayId, false) }
+                        idlePolicyMutex.withLock {
+                            // The app may have lost physical-window focus after the
+                            // input callback but before this coroutine acquired the
+                            // mutex. In that case leave monitoring enabled.
+                            if (requirePhysicalForeground && !MyApplication.isPhysicalDisplayForeground) {
+                                idleFreezeArmed.set(true)
+                                return@withLock
+                            }
+
+                            val resumeResult = controlApi.setIdleFreezeMonitoring(displayId, false)
+                            if (resumeResult.isFailure) {
+                                // Let the policy loop retry according to the current
+                                // foreground state rather than keeping a stale armed bit.
+                                idleFreezeArmed.set(false)
+                                return@withLock
+                            }
+
+                            // Close the remaining race where physical focus is lost
+                            // while the resume RPC is in flight.
+                            if (requirePhysicalForeground && !MyApplication.isPhysicalDisplayForeground) {
+                                idleFreezeArmed.set(true)
+                                val rearmResult = controlApi.setIdleFreezeMonitoring(displayId, true)
+                                if (rearmResult.isFailure) idleFreezeArmed.set(false)
+                            }
+                        }
                     } catch (t: Throwable) {
+                        idleFreezeArmed.set(false)
                         Log.d(TAG, "Failed to resume video after user activity", t)
                     }
                 }

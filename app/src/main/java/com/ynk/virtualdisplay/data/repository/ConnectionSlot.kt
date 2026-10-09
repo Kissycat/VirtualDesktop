@@ -432,7 +432,7 @@ class ConnectionSlot(
 
     override fun notifyVideoUserActivity(displayId: Int) {
         if (currentStreamingDisplayId == displayId) {
-            videoController.resumeFromUserActivity()
+            videoController.notifyUserActivity()
         }
     }
 

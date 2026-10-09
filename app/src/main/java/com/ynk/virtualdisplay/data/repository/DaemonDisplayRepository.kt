@@ -490,7 +490,7 @@ class DaemonDisplayRepository(
 
     override fun notifyVideoUserActivity(displayId: Int) {
         if (currentStreamingDisplayId == displayId) {
-            videoController.resumeFromUserActivity()
+            videoController.notifyUserActivity()
         }
     }
 

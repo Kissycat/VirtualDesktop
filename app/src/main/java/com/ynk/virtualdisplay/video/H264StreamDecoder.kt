@@ -362,16 +362,16 @@ class H264StreamDecoder(
         var lastStatsLogMs = System.currentTimeMillis()
         while (running.get() && !Thread.currentThread().isInterrupted) {
             try {
+                var tryAgain = false
                 var eos = false
-                var waitForCodec = false
                 synchronized(codecLock) {
                     val activeCodec = codec
                     if (activeCodec == null) {
-                        waitForCodec = true
+                        tryAgain = true
                         return@synchronized
                     }
                     val outputIndex = try {
-																								activeCodec.dequeueOutputBuffer(bufferInfo, 0) // 非阻塞：避免持锁等待饿死 rebuildCodec
+                        activeCodec.dequeueOutputBuffer(bufferInfo, 0) // 非阻塞：避免持锁等待饿死 rebuildCodec
                     } catch (e: IllegalStateException) {
                         if (running.get()) Log.w(TAG, "dequeueOutputBuffer failed", e)
                         return@synchronized
@@ -461,8 +461,7 @@ class H264StreamDecoder(
                             onVideoConfig?.invoke("H.264", visibleWidth, visibleHeight)
                         }
                         outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                            // The dequeue timeout already provides backoff; do not
-                            // add another fixed sleep here or stack two delays.
+                            tryAgain = true
                         }
                     }
                 }
@@ -470,7 +469,7 @@ class H264StreamDecoder(
                     Log.i(TAG, "Output EOS")
                     break
                 }
-                if (waitForCodec) Thread.sleep(5)
+                if (tryAgain) Thread.sleep(2)
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break
