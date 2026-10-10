@@ -3,6 +3,7 @@ package com.ynk.virtualdisplay.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
@@ -24,6 +25,9 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.ui.window.Dialog
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -45,6 +49,15 @@ import com.ynk.virtualdisplay.ui.components.AppSelectionDialog
 import kotlinx.coroutines.launch
 
 private data class DisplayPreset(val name: String, val width: Int, val height: Int, val dpi: Int)
+
+private fun Context.findLifecycleOwner(): LifecycleOwner? {
+    var current: Context? = this
+    while (current != null) {
+        if (current is LifecycleOwner) return current
+        current = (current as? ContextWrapper)?.baseContext
+    }
+    return null
+}
 
 @Composable
 fun VirtualDisplayScreen(
@@ -80,8 +93,27 @@ fun VirtualDisplayScreen(
         )
     }
 
-    LaunchedEffect(Unit) {
-        viewModel.handleIntent(MainIntent.RefreshDisplays)
+    // 每次控制台进入前台时，都执行与右上角刷新按钮完全相同的刷新动作。
+    // Screen 离开组合后 observer 会注销；从设置页返回控制台时重新注册，
+    // 即使 MainActivity 本身没有重新创建，也会同步到当前 RESUMED 状态并刷新。
+    val lifecycleOwner = remember(context) { context.findLifecycleOwner() }
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val owner = lifecycleOwner
+        if (owner == null) {
+            // 正常运行时 LocalContext 会包含 Activity；兼容预览/特殊 Context。
+            viewModel.handleIntent(MainIntent.RefreshDisplays)
+            onDispose { }
+        } else {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    viewModel.handleIntent(MainIntent.RefreshDisplays)
+                }
+            }
+            owner.lifecycle.addObserver(observer)
+            onDispose {
+                owner.lifecycle.removeObserver(observer)
+            }
+        }
     }
 
     // App Selection Dialog Handler
