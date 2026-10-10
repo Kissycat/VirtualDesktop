@@ -171,6 +171,13 @@ sealed class ControlMessage {
         }
     }
 
+    data class SetAutoDestroyEmptyDisplays(val enabled: Boolean) : ControlMessage() {
+        override val type: Int = TYPE_SET_AUTO_DESTROY_EMPTY_DISPLAYS
+        override fun encode(sequence: Long): ByteArray = buildMessage(type, sequence) {
+            writeByte(if (enabled) 1 else 0)
+        }
+    }
+
     protected fun buildMessage(type: Int, sequence: Long, block: DataOutputStream.() -> Unit): ByteArray {
         val baos = ByteArrayOutputStream()
         DataOutputStream(baos).use { dos ->
@@ -208,6 +215,7 @@ sealed class ControlMessage {
         const val TYPE_LIST_APPS = 218
         const val TYPE_PING = 219
         const val TYPE_SET_IDLE_FREEZE_MONITORING = 220
+        const val TYPE_SET_AUTO_DESTROY_EMPTY_DISPLAYS = 221
     }
 }
 

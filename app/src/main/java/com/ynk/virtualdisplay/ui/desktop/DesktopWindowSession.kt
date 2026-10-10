@@ -1,7 +1,11 @@
 package com.ynk.virtualdisplay.ui.desktop
 
+import android.content.Context
+import android.hardware.display.DisplayManager
 import android.util.Log
 import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
@@ -52,6 +56,7 @@ import kotlin.math.roundToInt
 internal class DesktopWindowSession(
     private val desktopDisplayId: Int,
     private val packageName: String,
+    context: Context,
 ) : Closeable {
 
     companion object {
@@ -66,6 +71,8 @@ internal class DesktopWindowSession(
     private val rpc = DaemonRpc(transport)
     private val controlApi = DaemonControlApiImpl(rpc, transport)
     private val video = VideoStreamController(transport, controlApi, scope)
+    private val displayManager = context.applicationContext
+        .getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     // All control-channel input must be serialized. The desktop shell can emit
     // DOWN/MOVE/UP events in rapid succession; launching each write in a fresh IO
     // coroutine can otherwise reorder or interleave frames on the socket.
@@ -74,14 +81,44 @@ internal class DesktopWindowSession(
     // one path performs RELEASE_VIRTUAL_DISPLAY before the daemon connection closes.
     private val stopMutex = Mutex()
 
-    private var displayId: Int = -1
+    @Volatile private var displayId: Int = -1
     private var taskId: Int = -1
-    private var started = false
+    @Volatile private var started = false
+    @Volatile private var displayListenerRegistered = false
+    @Volatile private var displayRemovedExternally = false
     private var outputSurface: Surface? = null
     @Volatile private var videoWidth: Int = 0
     @Volatile private var videoHeight: Int = 0
 
     var onSessionEnded: ((reason: String) -> Unit)? = null
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) = Unit
+
+        override fun onDisplayRemoved(removedDisplayId: Int) {
+            val ownedDisplayId = displayId
+            if (removedDisplayId != ownedDisplayId || ownedDisplayId < 0) return
+            // The daemon may auto-destroy this display when its app task exits.
+            // Mark it before notifying the owner so teardown never sends a second
+            // RELEASE_VIRTUAL_DISPLAY against an already-destroyed/reused ID.
+            displayRemovedExternally = true
+            Log.i(TAG, "OWNED_DISPLAY_REMOVED display=$removedDisplayId package=$packageName")
+            if (started) onSessionEnded?.invoke("display_removed")
+        }
+    }
+
+    private fun registerDisplayListener() {
+        if (displayListenerRegistered) return
+        displayManager.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
+        displayListenerRegistered = true
+    }
+
+    private fun unregisterDisplayListener() {
+        if (!displayListenerRegistered) return
+        runCatching { displayManager.unregisterDisplayListener(displayListener) }
+        displayListenerRegistered = false
+    }
 
     suspend fun start(
         surface: Surface,
@@ -105,6 +142,12 @@ internal class DesktopWindowSession(
             )
         }
         rpc.startMessageLoop(scope)
+        // This session may be the first/only client talking to a daemon (e.g.
+        // all small windows use independent sessions), so sync the persisted
+        // daemon-global auto-destroy policy before it creates its display.
+        controlApi.setAutoDestroyEmptyDisplays(AppSettings.getAutoDestroyEmptyDisplaysSync()).onFailure {
+            Log.w(TAG, "Failed to sync auto-destroy-empty-displays policy", it)
+        }
         scope.launch {
             rpc.deviceMessages.collect { message ->
                 val endedDisplay = (message as? com.ynk.virtualdisplay.protocol.DeviceMessage.GenericResponse)
@@ -147,11 +190,16 @@ internal class DesktopWindowSession(
         }
 
         displayId = displayResult.getOrThrow()
+        displayRemovedExternally = false
+        registerDisplayListener()
         Log.i(TAG, "CREATED display=$displayId parentDesktop=$desktopDisplayId package=$packageName size=${width}x$height dpi=$densityDpi")
 
         val activityResult = controlApi.startActivity(packageName, displayId, freeform = true)
         if (activityResult.isFailure) {
-            controlApi.releaseDisplay(displayId, moveTasksToDefaultDisplay = false)
+            unregisterDisplayListener()
+            if (!displayRemovedExternally) {
+                controlApi.releaseDisplay(displayId, moveTasksToDefaultDisplay = false)
+            }
             displayId = -1
             cleanupConnectionOnly()
             return@withContext Result.failure(activityResult.exceptionOrNull()!!)
@@ -173,13 +221,19 @@ internal class DesktopWindowSession(
         val videoResult = video.start(displayId, outputSurface, width, height)
         Log.i(TAG, "VIDEO_START display=$displayId success=${videoResult.isSuccess} error=${videoResult.exceptionOrNull()?.message}")
         if (videoResult.isFailure) {
-            controlApi.releaseDisplay(displayId, moveTasksToDefaultDisplay = false)
+            unregisterDisplayListener()
+            if (!displayRemovedExternally) {
+                controlApi.releaseDisplay(displayId, moveTasksToDefaultDisplay = false)
+            }
             displayId = -1
             cleanupConnectionOnly()
             return@withContext Result.failure(videoResult.exceptionOrNull()!!)
         }
 
         started = true
+        if (displayRemovedExternally) {
+            onSessionEnded?.invoke("display_removed")
+        }
         Result.success(Unit)
     }
 
@@ -348,10 +402,11 @@ internal class DesktopWindowSession(
 
             val id = displayId
             started = false
+            unregisterDisplayListener()
             runCatching { video.stop() }.onFailure {
                 Log.w(TAG, "Video stop failed during window teardown display=$id", it)
             }
-            if (id >= 0) {
+            if (id >= 0 && !displayRemovedExternally) {
                 val releaseResult = runCatching { controlApi.releaseDisplay(id, moveTasksToDefaultDisplay = false) }.getOrElse {
                     Result.failure<Unit>(it)
                 }
@@ -360,6 +415,8 @@ internal class DesktopWindowSession(
                 } else {
                     Log.i(TAG, "RELEASE_VIRTUAL_DISPLAY succeeded display=$id")
                 }
+            } else if (id >= 0) {
+                Log.i(TAG, "Skipping RELEASE_VIRTUAL_DISPLAY for externally removed display=$id")
             }
             displayId = -1
             taskId = -1
@@ -370,6 +427,7 @@ internal class DesktopWindowSession(
     }
 
     private suspend fun cleanupConnectionOnly() {
+        unregisterDisplayListener()
         runCatching { rpc.stopMessageLoop() }
         runCatching { transport.disconnect() }
     }

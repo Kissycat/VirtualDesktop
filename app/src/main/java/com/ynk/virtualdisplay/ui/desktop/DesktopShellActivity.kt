@@ -754,8 +754,8 @@ class DesktopShellActivity : ComponentActivity() {
         // drawer-specific gain 3x (2x -> 6x) while preserving the user's
         // global scroll-sensitivity multiplier in InputController.
         val drawerGain = 6f
-        val deltaX = (-hScroll * dp(288) * drawerGain).roundToInt()
-        val deltaY = (-vScroll * dp(288) * drawerGain).roundToInt()
+        val deltaX = (-hScroll * dp(300) * drawerGain).roundToInt()
+        val deltaY = (-vScroll * dp(450) * drawerGain).roundToInt()
         return when {
             drawerExpanded && drawerFullScroll != null -> {
                 when (val scrollable = drawerFullScroll) {

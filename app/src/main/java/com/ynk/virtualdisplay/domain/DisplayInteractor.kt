@@ -149,6 +149,9 @@ class DisplayInteractor(
         return repository.releaseDisplay(displayId, moveTasksToDefaultDisplay)
     }
 
+    suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> =
+        repository.setAutoDestroyEmptyDisplays(enabled)
+
     /**
      * 设置显示器 Surface（驱动视频解码器）。
      */

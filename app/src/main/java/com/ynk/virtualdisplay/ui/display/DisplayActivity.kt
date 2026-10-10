@@ -630,7 +630,7 @@ class DisplayActivity : ComponentActivity() {
 
         if (desktopMode || trackpadEnabled) {
             if (videoWidth > 0 && videoHeight > 0) {
-                DesktopCursorState.reset(videoWidth, videoHeight, videoDpi)
+                DesktopCursorState.showPreservingPosition(videoWidth, videoHeight, videoDpi)
             }
         } else {
             DesktopCursorState.hide()
@@ -669,7 +669,7 @@ class DisplayActivity : ComponentActivity() {
         applyLocalPreviewUi(hideLocalPreview)
         if (trackpadEnabled) {
             if (videoWidth > 0 && videoHeight > 0) {
-                DesktopCursorState.reset(videoWidth, videoHeight, videoDpi)
+                DesktopCursorState.showPreservingPosition(videoWidth, videoHeight, videoDpi)
             }
         } else {
             DesktopCursorState.hide()
@@ -804,7 +804,7 @@ class DisplayActivity : ComponentActivity() {
         inputController.updateVideoSize(width, height)
         videoSurfaceView.setVideoSize(width, height)
         if ((desktopMode || trackpadEnabled) && width > 0 && height > 0) {
-            DesktopCursorState.reset(width, height, videoDpi)
+            DesktopCursorState.resizePreservingPosition(width, height, videoDpi)
             if (::cursorOverlayView.isInitialized) cursorOverlayView.invalidate()
         }
 
@@ -933,7 +933,7 @@ class DisplayActivity : ComponentActivity() {
             inputController.updateVideoSize(width, height)
             videoSurfaceView.setVideoSize(width, height)
             if ((desktopMode || trackpadEnabled) && width > 0 && height > 0) {
-                DesktopCursorState.reset(width, height, videoDpi)
+                DesktopCursorState.resizePreservingPosition(width, height, videoDpi)
                 if (::cursorOverlayView.isInitialized) cursorOverlayView.invalidate()
             }
 

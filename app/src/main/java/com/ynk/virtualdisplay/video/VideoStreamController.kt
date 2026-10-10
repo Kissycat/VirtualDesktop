@@ -45,6 +45,7 @@ class VideoStreamController(
     private var idlePolicyJob: Job? = null
     private var gatewayStateJob: Job? = null
     private var backgroundQuiesceJob: Job? = null
+    private var backgroundResumeRetryJob: Job? = null
     private val backgroundWakePending = java.util.concurrent.atomic.AtomicBoolean(false)
     private val idlePolicyMutex = Mutex()
     private val lastUserActivityMs = java.util.concurrent.atomic.AtomicLong(0L)
@@ -76,7 +77,22 @@ class VideoStreamController(
     @Volatile private var requestedWidth = DEFAULT_WIDTH
     @Volatile private var requestedHeight = DEFAULT_HEIGHT
     @Volatile private var foregroundListenerRegistered = false
+    @Volatile private var physicalBackgroundSinceMs = 0L
+    @Volatile private var controlRecoveryJob: Job? = null
+    private val CONTROL_REBIND_AFTER_BACKGROUND_MS = 5_000L
     private val physicalForegroundListener: (Boolean) -> Unit = { foreground ->
+        // Record the transition synchronously before launching the asynchronous
+        // lifecycle worker. If the user clicks immediately after returning, the
+        // very first ROLE_CONTROL write must rebind before sending input.
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (!foreground) {
+            if (physicalBackgroundSinceMs == 0L) physicalBackgroundSinceMs = now
+        } else {
+            val since = physicalBackgroundSinceMs
+            if (since > 0L && now - since >= CONTROL_REBIND_AFTER_BACKGROUND_MS && requestedRunning) {
+                transport.markControlChannelForRecovery()
+            }
+        }
         scope.launch(Dispatchers.IO) {
             handlePhysicalForegroundChanged(foreground)
         }
@@ -294,12 +310,60 @@ class VideoStreamController(
 
     private suspend fun handlePhysicalForegroundChanged(foreground: Boolean) {
         if (!foreground) {
+            if (physicalBackgroundSinceMs == 0L) {
+                physicalBackgroundSinceMs = android.os.SystemClock.elapsedRealtime()
+            }
             // Do not trust the cached GO state on this transition. GO is a separate
             // privileged process and may have been launched through ADB/Shizuku.
             suspendForPhysicalBackground()
         } else {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val backgroundDuration = physicalBackgroundSinceMs.takeIf { it > 0L }?.let { now - it } ?: 0L
+            physicalBackgroundSinceMs = 0L
             cancelBackgroundQuiesce()
+            val workerWasQuiesced = pausedForPhysicalBackground
             resumeRequestedStream()
+
+            // If GO kept the APP worker alive, it is possible that its old ROLE_CONTROL
+            // TCP socket survived locally but the remote Controller loop was lost while
+            // the device was in deep background. A write-only heartbeat cannot detect
+            // every half-open TCP case. After a genuinely long background transition,
+            // rebind just this APP session's control channel; GO has its own session and
+            // keeps its audio/video subscription untouched.
+            if (!workerWasQuiesced && backgroundDuration >= CONTROL_REBIND_AFTER_BACKGROUND_MS &&
+                requestedRunning && running && currentDisplayId >= 0) {
+                recoverControlChannelAfterBackground(currentDisplayId)
+            }
+        }
+    }
+
+    private fun recoverControlChannelAfterBackground(displayId: Int) {
+        controlRecoveryJob?.cancel()
+        controlRecoveryJob = scope.launch(Dispatchers.IO) {
+            repeat(3) { attempt ->
+                if (!MyApplication.isPhysicalDisplayForeground || !requestedRunning || currentDisplayId != displayId) return@launch
+                val recovered = runCatching { transport.forceReconnectControlChannel(displayId) }.getOrDefault(false)
+                if (recovered) {
+                    Log.i(TAG, "ROLE_CONTROL recovered after long background (displayId=$displayId, attempt=${attempt + 1})")
+                    return@launch
+                }
+                delay(500L * (attempt + 1))
+            }
+
+            // If ROLE_CONTROL alone cannot be rebound (for example the daemon's
+            // per-session role declaration expired), rebuild this APP's role sockets
+            // as a last resort. This never sends EXIT_DAEMON or releases the display.
+            mutex.withLock {
+                if (!MyApplication.isPhysicalDisplayForeground || !requestedRunning ||
+                    currentDisplayId != displayId || pausedForPhysicalBackground) return@withLock
+                val surface = requestedSurface
+                if (surface != null && !surface.isValid) return@withLock
+                Log.w(TAG, "ROLE_CONTROL recovery exhausted; rebuilding this APP's local stream session for display=$displayId")
+                val result = startTransportLocked(displayId, surface, requestedWidth, requestedHeight)
+                if (result.isFailure) {
+                    Log.e(TAG, "Full local stream-session recovery failed for display=$displayId", result.exceptionOrNull())
+                }
+            }
         }
     }
 
@@ -359,8 +423,10 @@ class VideoStreamController(
             val surface = requestedSurface
             if (surface != null && !surface.isValid) {
                 // Surface callbacks may arrive just after the app regains focus.
-                // Stay quiescent and retry when setSurface receives a valid one.
+                // Stay quiescent and retry when setSurface receives a valid one;
+                // a bounded-delay retry also covers a missed lifecycle callback.
                 Log.d(TAG, "Waiting for a valid local surface before resuming display=$displayId")
+                scheduleBackgroundResumeRetry()
                 return@withLock
             }
 
@@ -379,6 +445,33 @@ class VideoStreamController(
             if (result.isFailure) {
                 pausedForPhysicalBackground = true
                 Log.w(TAG, "Could not resume local video worker for display=$displayId", result.exceptionOrNull())
+                scheduleBackgroundResumeRetry()
+            } else {
+                backgroundResumeRetryJob?.cancel()
+                backgroundResumeRetryJob = null
+            }
+        }
+    }
+
+    /** Retry failed foreground/background-resume handshakes instead of leaving a dead input channel until process restart. */
+    private fun scheduleBackgroundResumeRetry() {
+        if (backgroundResumeRetryJob?.isActive == true) return
+        backgroundResumeRetryJob = scope.launch(Dispatchers.IO) {
+            var attempt = 0
+            val delays = longArrayOf(500L, 1_000L, 2_000L, 3_000L, 5_000L)
+            while (isActive && requestedRunning && pausedForPhysicalBackground) {
+                if (!canRunWhilePhysicalBackgrounded()) return@launch
+                delay(delays[attempt.coerceAtMost(delays.lastIndex)])
+                if (!isActive || !requestedRunning || !pausedForPhysicalBackground) return@launch
+                if (!canRunWhilePhysicalBackgrounded()) return@launch
+                val surface = requestedSurface
+                if (surface != null && !surface.isValid) {
+                    attempt++
+                    continue
+                }
+                resumeRequestedStream()
+                if (!pausedForPhysicalBackground) return@launch
+                attempt++
             }
         }
     }
@@ -413,6 +506,11 @@ class VideoStreamController(
         }
         gatewayStateJob?.cancel()
         gatewayStateJob = null
+        controlRecoveryJob?.cancel()
+        controlRecoveryJob = null
+        backgroundResumeRetryJob?.cancel()
+        backgroundResumeRetryJob = null
+        physicalBackgroundSinceMs = 0L
         stopInternal()
     }
 

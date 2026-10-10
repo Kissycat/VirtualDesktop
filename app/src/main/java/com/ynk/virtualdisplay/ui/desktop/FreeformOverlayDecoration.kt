@@ -181,14 +181,29 @@ internal class FreeformOverlayDecoration(
     private var maximizedSavedW = initialContentWidth
     private var maximizedSavedH = initialContentHeight
 
-    private val windowSession = DesktopWindowSession(desktopDisplay.displayId, packageName)
+    private val windowSession = DesktopWindowSession(
+        desktopDisplay.displayId,
+        packageName,
+        activity.applicationContext,
+    )
     private val sessionScope = MainScope()
     private var sessionStarted = false
 
     init {
         windowSession.onSessionEnded = { reason ->
-            Log.i("FreeformOverlayDecoration", "SESSION_ENDED pkg=$packageName display=${windowSession.windowDisplayId()} reason=$reason -> trigger")
-            activity.runOnUiThread { if (!released) exitTrigger.visibility = View.VISIBLE }
+            Log.i("FreeformOverlayDecoration", "SESSION_ENDED pkg=$packageName display=${windowSession.windowDisplayId()} reason=$reason")
+            activity.runOnUiThread {
+                if (released || closing) return@runOnUiThread
+                if (reason == "display_removed") {
+                    // The daemon's empty-display monitor already destroyed this
+                    // window's VirtualDisplay. Remove the parent-side window chrome
+                    // immediately, and let DesktopWindowSession skip a duplicate
+                    // release against the now-dead display ID.
+                    closeWindowFromSessionEnd()
+                } else {
+                    exitTrigger.visibility = View.VISIBLE
+                }
+            }
         }
     }
     private var resizeJob: Job? = null

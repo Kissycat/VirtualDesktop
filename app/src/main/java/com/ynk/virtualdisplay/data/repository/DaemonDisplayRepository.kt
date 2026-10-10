@@ -196,6 +196,7 @@ class DaemonDisplayRepository(
                         rpc.startMessageLoop(this@launch)
                         _connectionStatus.value = ConnectionStatus.CONNECTED
                         _connectionError.value = null
+                        syncAutoDestroyEmptyDisplaysPolicy()
                         refreshManagedDisplays()
                         Log.i(TAG, "Auto-reconnect succeeded on attempt $attempt (sessionId=${transport.session?.sessionId})")
                         return@launch
@@ -293,6 +294,7 @@ class DaemonDisplayRepository(
                 rpc.startMessageLoop(scope)
                 _connectionStatus.value = ConnectionStatus.CONNECTED
                 _connectionError.value = null
+                syncAutoDestroyEmptyDisplaysPolicy()
                 refreshManagedDisplays()
                 Result.success(Unit)
             } else {
@@ -308,6 +310,18 @@ class DaemonDisplayRepository(
             _connectionStatus.value = ConnectionStatus.ERROR
             Result.failure(e)
         }
+    }
+
+    private suspend fun syncAutoDestroyEmptyDisplaysPolicy() {
+        val enabled = AppSettings.getAutoDestroyEmptyDisplaysSync()
+        remoteDataSource.setAutoDestroyEmptyDisplays(enabled).onFailure {
+            Log.w(TAG, "Failed to sync auto-destroy-empty-displays policy=$enabled", it)
+        }
+    }
+
+    override suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> {
+        if (_connectionStatus.value != ConnectionStatus.CONNECTED) return Result.success(Unit)
+        return remoteDataSource.setAutoDestroyEmptyDisplays(enabled)
     }
 
     override fun unbindService() {

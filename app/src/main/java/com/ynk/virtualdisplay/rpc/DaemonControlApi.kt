@@ -50,6 +50,7 @@ interface DaemonControlApi {
     suspend fun isRotationFrozen(displayId: Int): Result<Boolean>
     suspend fun ping(): Result<Long>
     suspend fun setIdleFreezeMonitoring(displayId: Int, enabled: Boolean): Result<Unit>
+    suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit>
 }
 
 class DaemonControlApiImpl(
@@ -330,6 +331,17 @@ class DaemonControlApiImpl(
             } else {
                 Result.failure(IllegalStateException(resp.message ?: "Failed code: ${resp.statusCode}"))
             }
+        } else {
+            Result.failure(IllegalStateException("Unexpected response type: $resp"))
+        }
+    }
+
+    override suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> {
+        val msg = ControlMessage.SetAutoDestroyEmptyDisplays(enabled)
+        val resp = rpc.sendAndAwait(msg) ?: return Result.failure(IOException("Connection error or timeout"))
+        return if (resp is DeviceMessage.GenericResponse) {
+            if (resp.statusCode == 0) Result.success(Unit)
+            else Result.failure(IllegalStateException(resp.message ?: "Failed code: ${resp.statusCode}"))
         } else {
             Result.failure(IllegalStateException("Unexpected response type: $resp"))
         }

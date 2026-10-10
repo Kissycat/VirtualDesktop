@@ -68,6 +68,10 @@ class DaemonTransport {
     // daemon_secret_token 认证。null 表示不发送认证。
     @Volatile private var secretToken: String? = null
     @Volatile private var controlDisplayId: Int = -1
+    // A long physical-background interval may leave a locally writable but stale
+    // server-side Controller. Set this synchronously at foreground return; the first
+    // control write then performs a locked rebind before sending the user's input.
+    private val controlRecoveryRequired = java.util.concurrent.atomic.AtomicBoolean(false)
     private val controlReconnectLock = Any()
 
     @Volatile
@@ -92,6 +96,16 @@ class DaemonTransport {
     fun writeControlMessage(block: (DataOutputStream) -> Unit): Boolean {
         synchronized(controlWriteLock) {
             var out = controlOut
+            if (controlRecoveryRequired.compareAndSet(true, false)) {
+                // Close/rebind before writing. A successful TCP write to a half-open
+                // channel is not evidence that the remote Controller loop still lives.
+                closeControlChannelLocked()
+                out = reconnectControlChannelLocked()
+                if (out == null) {
+                    controlRecoveryRequired.set(true)
+                    return false
+                }
+            }
             if (out == null) {
                 out = reconnectControlChannelLocked() ?: return false
             }
@@ -172,6 +186,9 @@ class DaemonTransport {
                 throw IOException("Video socket displayId ack mismatch: expected $displayId, server ack=$videoAck")
             }
 
+            // These are fresh sockets/handshakes, so they satisfy any pending
+            // recovery requested while the old local stream was quiescent.
+            controlRecoveryRequired.set(false)
             Log.i(TAG, "Video channel connected (session ${currentSession.sessionId}, displayId=$displayId, ack=$videoAck). Service auto-starts stream on bind.")
             true
         } catch (e: IOException) {
@@ -226,6 +243,38 @@ class DaemonTransport {
         }
     }
 
+    /**
+     * Force a fresh ROLE_CONTROL server Controller without touching ROLE_VIDEO or
+     * the negotiation channel. TCP writes can appear successful on a half-open
+     * socket after Doze/background suspension even when the daemon's controller
+     * loop has died; an explicit re-bind makes the server replace that stale loop.
+     */
+    /** Mark the channel stale without doing socket work on the lifecycle callback thread. */
+    fun markControlChannelForRecovery() {
+        controlRecoveryRequired.set(true)
+    }
+
+    fun forceReconnectControlChannel(displayId: Int): Boolean = synchronized(controlWriteLock) {
+        if (session == null || displayId < 0 || host.isEmpty() || port <= 0) return@synchronized false
+        controlDisplayId = displayId
+        val socket = controlSocket
+        val channelLooksConnected = controlOut != null && socket != null &&
+            socket.isConnected && !socket.isClosed
+        if (channelLooksConnected && !controlRecoveryRequired.get()) {
+            // The foreground listener's first input may already have performed the
+            // pending rebind. Do not tear down that newly healthy channel a second time.
+            return@synchronized true
+        }
+        controlRecoveryRequired.compareAndSet(true, false)
+        closeControlChannelLocked()
+        val reconnected = reconnectControlChannelLocked() != null
+        if (!reconnected) {
+            controlRecoveryRequired.set(true)
+            Log.w(TAG, "Forced ROLE_CONTROL reconnect failed (displayId=$displayId, session=${session?.sessionId})")
+        }
+        reconnected
+    }
+
     fun disconnectScrcpyChannels() {
         runCatching { controlIn?.close() }
         runCatching { controlOut?.close() }
@@ -236,6 +285,7 @@ class DaemonTransport {
         controlSocket = null
         videoSocket = null
         controlDisplayId = -1
+        controlRecoveryRequired.set(false)
         Log.i(TAG, "Scrcpy channels disconnected")
     }
 

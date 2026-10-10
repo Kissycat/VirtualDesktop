@@ -61,6 +61,36 @@ object DesktopCursorState {
         if (changed) notifyChanged()
     }
 
+    /**
+     * Update the coordinate space without jumping the visible cursor to the
+     * center. Video config callbacks can be emitted again after reconnects or
+     * Surface rebinding even when the user has not asked to reset the pointer.
+     * Keep its relative location across resolution changes and preserve the
+     * last location when the overlay is made visible again.
+     */
+    fun showPreservingPosition(w: Int, h: Int, displayDpi: Int = dpi.get()) {
+        val safeW = w.coerceAtLeast(1)
+        val safeH = h.coerceAtLeast(1)
+        val oldW = width.get().coerceAtLeast(1)
+        val oldH = height.get().coerceAtLeast(1)
+        val newDpi = displayDpi.coerceAtLeast(1)
+        val newX = (x.get().toFloat() / oldW * safeW).toInt().coerceIn(0, safeW)
+        val newY = (y.get().toFloat() / oldH * safeH).toInt().coerceIn(0, safeH)
+        val changed = width.get() != safeW || height.get() != safeH ||
+            dpi.get() != newDpi || x.get() != newX || y.get() != newY || !visible.get()
+        width.set(safeW)
+        height.set(safeH)
+        dpi.set(newDpi)
+        x.set(newX)
+        y.set(newY)
+        visible.set(true)
+        if (changed) notifyChanged()
+    }
+
+    /** Update the canvas dimensions while keeping the current normalized pointer position. */
+    fun resizePreservingPosition(w: Int, h: Int, displayDpi: Int = dpi.get()) =
+        showPreservingPosition(w, h, displayDpi)
+
     fun update(cursorX: Float, cursorY: Float, w: Int, h: Int, displayDpi: Int = dpi.get()) {
         val safeW = w.coerceAtLeast(1)
         val safeH = h.coerceAtLeast(1)

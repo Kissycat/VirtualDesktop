@@ -33,6 +33,9 @@ class DaemonRemoteDataSource(
     suspend fun getActiveDisplayIds(): Result<IntArray> =
         controlApi.getActiveDisplayIds()
 
+    suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> =
+        controlApi.setAutoDestroyEmptyDisplays(enabled)
+
     suspend fun getActiveDisplayInfos(): Result<List<com.ynk.virtualdisplay.protocol.DeviceMessage.DisplayInfoEntry>> =
         controlApi.getActiveDisplayInfos()
 

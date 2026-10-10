@@ -51,6 +51,7 @@ fun SettingsScreen(
     val captureBack by AppSettings.captureBackFlow(context).collectAsState(initial = false)
     val ultraLowLatency by AppSettings.ultraLowLatencyFlow(context).collectAsState(initial = false)
     val moveTasksOnDestroy by AppSettings.moveTasksOnDestroyFlow(context).collectAsState(initial = true)
+    val autoDestroyEmptyDisplays by AppSettings.autoDestroyEmptyDisplaysFlow(context).collectAsState(initial = true)
 
     val flagStates = remember {
         mutableStateMapOf<String, Boolean>()
@@ -257,6 +258,17 @@ fun SettingsScreen(
                                 scope.launch {
                                     AppSettings.setMoveTasksOnDestroy(context, isChecked)
                                 }
+                            }
+                        )
+
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
+
+                        SettingSwitchRow(
+                            title = "虚拟屏幕无应用时自动销毁",
+                            description = "默认开启。虚拟屏幕内没有用户应用持续运行时，自动释放该显示器；普通模式、桌面主屏和悬浮窗模式均生效，并会等待启动/切换宽限期以避免误销毁。",
+                            checked = autoDestroyEmptyDisplays,
+                            onCheckedChange = { enabled ->
+                                viewModel.handleIntent(MainIntent.UpdateAutoDestroyEmptyDisplays(enabled))
                             }
                         )
                     }

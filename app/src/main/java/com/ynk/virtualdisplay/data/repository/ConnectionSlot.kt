@@ -163,6 +163,7 @@ class ConnectionSlot(
                         rpc.startMessageLoop(this@launch)
                         _connectionStatus.value = ConnectionStatus.CONNECTED
                         _connectionError.value = null
+                        syncAutoDestroyEmptyDisplaysPolicy()
                         refreshManagedDisplays()
                         Log.i(TAG, "[${node.uniqueKey()}] Reconnect succeeded on attempt $attempt")
                         return@launch
@@ -232,6 +233,7 @@ class ConnectionSlot(
                     rpc.startMessageLoop(scope)
                     _connectionStatus.value = ConnectionStatus.CONNECTED
                     _connectionError.value = null
+                    syncAutoDestroyEmptyDisplaysPolicy()
                     refreshManagedDisplays()
                 } else if (_connectionError.value == null) {
                     val err = "连接失败：无法建立到 ${host}:${port} 的连接。"
@@ -245,6 +247,18 @@ class ConnectionSlot(
                 _connectionStatus.value = ConnectionStatus.ERROR
             }
         }
+    }
+
+    private suspend fun syncAutoDestroyEmptyDisplaysPolicy() {
+        val enabled = AppSettings.getAutoDestroyEmptyDisplaysSync()
+        remoteDataSource.setAutoDestroyEmptyDisplays(enabled).onFailure {
+            Log.w(TAG, "[${node.uniqueKey()}] Failed to sync auto-destroy-empty-displays policy=$enabled", it)
+        }
+    }
+
+    override suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> {
+        if (_connectionStatus.value != ConnectionStatus.CONNECTED) return Result.success(Unit)
+        return remoteDataSource.setAutoDestroyEmptyDisplays(enabled)
     }
 
     override fun unbindService() {

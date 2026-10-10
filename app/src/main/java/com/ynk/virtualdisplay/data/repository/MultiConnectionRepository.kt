@@ -124,6 +124,19 @@ class MultiConnectionRepository(
     ): Result<Unit> = activeSlot?.releaseDisplay(displayId, moveTasksToDefaultDisplay)
         ?: Result.failure(noActiveSlotError())
 
+    override suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> {
+        val active = activeSlot ?: return Result.failure(noActiveSlotError())
+        // The policy is daemon-global. Propagate it to all currently connected
+        // slots, while always reporting the active node's result to the UI.
+        var activeResult: Result<Unit> = Result.success(Unit)
+        slots.values.filter { it.connectionStatus.value == ConnectionStatus.CONNECTED }.forEach { slot ->
+            val result = runCatching { slot.setAutoDestroyEmptyDisplays(enabled) }
+                .getOrElse { Result.failure(it) }
+            if (slot === active) activeResult = result
+        }
+        return activeResult
+    }
+
     override suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit> =
         activeSlot?.setDisplaySurface(displayId, surface) ?: Result.failure(noActiveSlotError())
 

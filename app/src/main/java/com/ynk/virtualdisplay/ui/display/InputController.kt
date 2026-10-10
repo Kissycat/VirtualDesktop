@@ -85,6 +85,7 @@ class InputController(
     // and converts finger deltas into absolute mouse moves.
     private var trackpadCursorX = 0f
     private var trackpadCursorY = 0f
+    private var trackpadCursorInitialized = false
     private var trackpadLastX = 0f
     private var trackpadLastY = 0f
     private var trackpadDownX = 0f
@@ -232,6 +233,17 @@ class InputController(
         mainVideoWidth = width
         mainVideoHeight = height
         if (videoWidth != width || videoHeight != height) {
+            val oldWidth = videoWidth
+            val oldHeight = videoHeight
+            if (trackpadCursorInitialized && oldWidth > 0 && oldHeight > 0 && width > 0 && height > 0) {
+                // The input controller owns the absolute remote pointer. Keep it
+                // aligned with DesktopCursorState when the decoder reconnects or
+                // the display changes resolution; otherwise a later MOVE snaps
+                // the overlay back to this stale coordinate.
+                trackpadCursorX = (trackpadCursorX * width / oldWidth).coerceIn(0f, width.toFloat())
+                trackpadCursorY = (trackpadCursorY * height / oldHeight).coerceIn(0f, height.toFloat())
+                DesktopCursorState.update(trackpadCursorX, trackpadCursorY, width, height)
+            }
             videoWidth = width
             videoHeight = height
             invalidateContentRectCache()
@@ -284,10 +296,22 @@ class InputController(
         if (!hasVideoSize()) return true
         val displayId = displayIdProvider() ?: return false
 
-        if (trackpadCursorX <= 0f && trackpadCursorY <= 0f) {
-            trackpadCursorX = videoWidth * 0.5f
-            trackpadCursorY = videoHeight * 0.5f
-            DesktopCursorState.reset(videoWidth, videoHeight)
+        if (!trackpadCursorInitialized) {
+            val previousCursor = DesktopCursorState.snapshot()
+            if (previousCursor.visible && previousCursor.width > 0 && previousCursor.height > 0) {
+                // A newly-created/rebound Activity may get a fresh InputController
+                // while the process-wide cursor overlay still has the user's last
+                // location. Adopt that position instead of flashing to center.
+                trackpadCursorX = (previousCursor.x.toFloat() / previousCursor.width * videoWidth)
+                    .coerceIn(0f, videoWidth.toFloat())
+                trackpadCursorY = (previousCursor.y.toFloat() / previousCursor.height * videoHeight)
+                    .coerceIn(0f, videoHeight.toFloat())
+            } else {
+                trackpadCursorX = videoWidth * 0.5f
+                trackpadCursorY = videoHeight * 0.5f
+            }
+            trackpadCursorInitialized = true
+            DesktopCursorState.update(trackpadCursorX, trackpadCursorY, videoWidth, videoHeight)
         }
 
         // Multi-touch arbitration is deliberately strict:

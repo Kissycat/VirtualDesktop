@@ -51,6 +51,8 @@ class AppSettingsDataSource(private val context: Context) {
     /** 销毁虚拟显示器后是否将应用移回主屏（内存缓存） */
     val moveTasksOnDestroyCache: StateFlow<Boolean> = AppSettings.moveTasksOnDestroyCache
 
+    val autoDestroyEmptyDisplaysCache: StateFlow<Boolean> = AppSettings.autoDestroyEmptyDisplaysCache
+
     // === 同步读缓存（getXxxSync）===
 
     /** 同步读取特权模式 */
@@ -64,6 +66,8 @@ class AppSettingsDataSource(private val context: Context) {
 
     /** 同步读取销毁虚拟显示器后是否将应用移回主屏 */
     fun getMoveTasksOnDestroySync(): Boolean = AppSettings.getMoveTasksOnDestroySync()
+
+    fun getAutoDestroyEmptyDisplaysSync(): Boolean = AppSettings.getAutoDestroyEmptyDisplaysSync()
 
     // === Daemon 连接配置（serverHost / serverPort / serverPassword）===
 
@@ -136,6 +140,10 @@ class AppSettingsDataSource(private val context: Context) {
 
     /** 设置销毁虚拟显示器后是否将应用移回主屏 */
     suspend fun setMoveTasksOnDestroy(enabled: Boolean) = AppSettings.setMoveTasksOnDestroy(context, enabled)
+
+    fun autoDestroyEmptyDisplaysFlow(): Flow<Boolean> = AppSettings.autoDestroyEmptyDisplaysFlow(context)
+
+    suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean) = AppSettings.setAutoDestroyEmptyDisplays(context, enabled)
 
     // === 服务器节点列表（serverNodes / currentServerNode）===
 

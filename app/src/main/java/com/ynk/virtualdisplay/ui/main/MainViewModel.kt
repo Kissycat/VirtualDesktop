@@ -159,6 +159,7 @@ class MainViewModel(
             is MainIntent.AddServerNode -> addServerNode(intent.node)
             is MainIntent.RemoveServerNode -> removeServerNode(intent.node)
             is MainIntent.UpdatePrivilegeMode -> updatePrivilegeMode(intent.mode)
+            is MainIntent.UpdateAutoDestroyEmptyDisplays -> updateAutoDestroyEmptyDisplays(intent.enabled)
             is MainIntent.CheckRootPermission -> checkRootPermission()
             is MainIntent.StartServer -> startServer()
             is MainIntent.StopServer -> stopServer()
@@ -219,6 +220,19 @@ class MainViewModel(
             if (current.host == node.host && current.port == node.port) {
                 val localNode = com.ynk.virtualdisplay.data.ServerNode("本机", NetUtils.LOCAL_HOST, 27183, "")
                 selectServerNode(localNode)
+            }
+        }
+    }
+
+    private fun updateAutoDestroyEmptyDisplays(enabled: Boolean) {
+        viewModelScope.launch {
+            AppSettings.setAutoDestroyEmptyDisplays(appContext, enabled)
+            val result = interactor.setAutoDestroyEmptyDisplays(enabled)
+            result.onFailure {
+                // Persist the preference even while disconnected; the repository
+                // reapplies it automatically after the next successful handshake.
+                Log.w(TAG, "Auto-destroy policy saved but daemon update failed", it)
+                _effect.emit(MainEffect.ShowToast("已保存设置，服务端将在下次连接时应用"))
             }
         }
     }

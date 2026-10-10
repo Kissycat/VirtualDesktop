@@ -84,6 +84,7 @@ sealed class MainIntent {
     data class AddServerNode(val node: com.ynk.virtualdisplay.data.ServerNode) : MainIntent()
     data class RemoveServerNode(val node: com.ynk.virtualdisplay.data.ServerNode) : MainIntent()
     data class UpdatePrivilegeMode(val mode: com.ynk.virtualdisplay.data.PrivilegeMode) : MainIntent()
+    data class UpdateAutoDestroyEmptyDisplays(val enabled: Boolean) : MainIntent()
     data object CheckRootPermission : MainIntent()
     data object StartServer : MainIntent()
     data object StopServer : MainIntent()

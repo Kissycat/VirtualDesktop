@@ -65,6 +65,9 @@ interface IDisplayRepository {
         moveTasksToDefaultDisplay: Boolean = true,
     ): Result<Unit>
 
+    /** Configure daemon-wide automatic cleanup for virtual displays without user app tasks. */
+    suspend fun setAutoDestroyEmptyDisplays(enabled: Boolean): Result<Unit> = Result.success(Unit)
+
     /** 设置显示器 Surface — 驱动客户端 H264 解码器 */
     suspend fun setDisplaySurface(displayId: Int, surface: Surface?): Result<Unit>
     /** Independent H.264 stream used by each LMO-style virtual-display window. */

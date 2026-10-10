@@ -121,6 +121,7 @@ object AppSettings {
     val privilegeModeKey = stringPreferencesKey("privilege_mode")
     val ultraLowLatencyKey = booleanPreferencesKey("ultra_low_latency")
     val moveTasksOnDestroyKey = booleanPreferencesKey("move_tasks_on_destroy")
+    val autoDestroyEmptyDisplaysKey = booleanPreferencesKey("auto_destroy_empty_displays")
 
     private val _captureBackCache = MutableStateFlow(false)
     val captureBackCache: StateFlow<Boolean> = _captureBackCache
@@ -139,6 +140,11 @@ object AppSettings {
 
     private val _moveTasksOnDestroyCache = MutableStateFlow(true)
     val moveTasksOnDestroyCache: StateFlow<Boolean> = _moveTasksOnDestroyCache
+
+    // Enabled by default: release a virtual display after no user app task has
+    // remained on it for the server-side empty-display grace period.
+    private val _autoDestroyEmptyDisplaysCache = MutableStateFlow(true)
+    val autoDestroyEmptyDisplaysCache: StateFlow<Boolean> = _autoDestroyEmptyDisplaysCache
 
     @Volatile
     private var initialized = false
@@ -159,6 +165,7 @@ object AppSettings {
                 _showPerformanceStatsCache.value = prefs[showPerformanceStatsKey] ?: true
                 _ultraLowLatencyCache.value = prefs[ultraLowLatencyKey] ?: false
                 _moveTasksOnDestroyCache.value = prefs[moveTasksOnDestroyKey] ?: true
+                _autoDestroyEmptyDisplaysCache.value = prefs[autoDestroyEmptyDisplaysKey] ?: true
 
                 val modeStr = prefs[privilegeModeKey] ?: PrivilegeMode.SHIZUKU.name
                 _privilegeModeCache.value = try {
@@ -590,6 +597,20 @@ object AppSettings {
     /** 持久化「销毁虚拟显示器后是否将应用移回主屏」配置。 */
     suspend fun setMoveTasksOnDestroy(context: Context, enabled: Boolean) {
         context.applicationContext.dataStore.edit { it[moveTasksOnDestroyKey] = enabled }
+    }
+
+    /** Whether a virtual display should be destroyed when it contains no user app tasks (default true). */
+    fun autoDestroyEmptyDisplaysFlow(context: Context): Flow<Boolean> =
+        context.applicationContext.dataStore.data.map { prefs -> prefs[autoDestroyEmptyDisplaysKey] ?: true }
+
+    /** Synchronous cached value; defaults to enabled before DataStore emits its first snapshot. */
+    fun getAutoDestroyEmptyDisplaysSync(): Boolean = _autoDestroyEmptyDisplaysCache.value
+
+    suspend fun setAutoDestroyEmptyDisplays(context: Context, enabled: Boolean) {
+        context.applicationContext.dataStore.edit { it[autoDestroyEmptyDisplaysKey] = enabled }
+        // Update the hot cache immediately so a daemon reconnect racing this write
+        // cannot briefly re-apply the previous policy value.
+        _autoDestroyEmptyDisplaysCache.value = enabled
     }
 
     /**
