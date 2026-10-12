@@ -7,15 +7,12 @@ import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.InputDevice
-import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.WindowManager
 import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
@@ -182,6 +179,7 @@ class DisplayActivity : ComponentActivity() {
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var videoSurfaceView: VideoSurfaceView
+    private lateinit var imeProxyView: RemoteImeProxyView
     private lateinit var cursorOverlayView: DesktopCursorOverlayView
     private lateinit var statsOverlay: TextView
     private lateinit var controlPanel: DisplayControlPanel
@@ -244,6 +242,10 @@ class DisplayActivity : ComponentActivity() {
         // the touchpad switch.
         trackpadEnabled = desktopMode
 
+        // Configure the remote-video window before the SurfaceView is created. Doing
+        // this lazily from the first keyboard toggle forces a one-off window relayout
+        // at the same moment the IME creates its surface, which can freeze first-show.
+        configureStableImeWindow()
         requestHighRefreshRate()
         enterFullscreen()
         setupContentView(displayId)
@@ -305,7 +307,13 @@ class DisplayActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        closeImeBridge()
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        closeImeBridge()
         desktopWebRtcMonitorJob?.cancel()
         // The gateway is an independent privileged process and intentionally
         // survives Activity/Surface recreation and switching the APP to background.
@@ -333,9 +341,19 @@ class DisplayActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) {
+        // A floating IME can temporarily take and return window focus. Reapplying
+        // immersive insets while its InputConnection is active needlessly churns the
+        // WindowInsets state; restore fullscreen only after the IME session has ended.
+        if (hasFocus && (!::imeProxyView.isInitialized || !imeProxyView.isKeyboardActive())) {
             enterFullscreen()
         }
+    }
+
+    private fun configureStableImeWindow() {
+        val currentMode = window.attributes.softInputMode
+        val stableMode = (currentMode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST.inv()) or
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+        if (currentMode != stableMode) window.setSoftInputMode(stableMode)
     }
 
     private fun requestHighRefreshRate() {
@@ -418,19 +436,30 @@ class DisplayActivity : ComponentActivity() {
                     return inputController.handleKeyEvent(event)
                 }
 
-                override fun injectText(text: String): Boolean {
-                    return injectTextViaKeyMap(text)
-                }
+                override fun injectText(text: String): Boolean = inputController.injectText(text)
 
-                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                    for (i in 0 until beforeLength) {
-                        inputController.injectKey(KeyEvent.KEYCODE_DEL)
-                    }
-                    return true
-                }
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
+                    inputController.deleteSurroundingText(beforeLength, afterLength)
             })
         }
         rootLayout.addView(videoSurfaceView)
+
+        // The IME must target a separate transparent view, never the video SurfaceView.
+        // This avoids the first keyboard show changing the SurfaceView's focus/composition
+        // layer and keeps the stream surface geometry independent from the keyboard.
+        imeProxyView = RemoteImeProxyView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START)
+            setCallbacks(object : RemoteImeProxyView.Callbacks {
+                override fun injectKeyEvent(event: KeyEvent): Boolean = inputController.handleKeyEvent(event)
+                override fun injectText(text: String): Boolean = inputController.injectText(text)
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
+                    inputController.deleteSurroundingText(beforeLength, afterLength)
+                override fun onKeyboardDismissed() {
+                    (application as? MyApplication)?.setImeBridgeActive(this@DisplayActivity, false)
+                }
+            })
+        }
+        rootLayout.addView(imeProxyView)
 
         // Draw the desktop/trackpad cursor in the app window itself. A system
         // mouse pointer is a separate SurfaceFlinger layer and is not included
@@ -1005,22 +1034,44 @@ class DisplayActivity : ComponentActivity() {
     }
 
     private fun toggleKeyboard() {
-        if (!::videoSurfaceView.isInitialized) return
-        val willEnable = !videoSurfaceView.isKeyboardActive()
-        videoSurfaceView.requestKeyboardInput(willEnable)
-
+        if (!::imeProxyView.isInitialized) return
+        val willEnable = !imeProxyView.isKeyboardActive()
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+
         if (willEnable) {
-            val targetView = videoSurfaceView
-            targetView.requestFocus()
-            Handler(Looper.getMainLooper()).post {
+            // The soft-input mode was fixed before the video SurfaceView was created;
+            // opening the IME must not mutate window attributes or surface geometry.
+            imeProxyView.requestKeyboardInput(true)
+            (application as? MyApplication)?.setImeBridgeActive(this, true)
+            imeProxyView.post {
+                if (!imeProxyView.isKeyboardActive() || isFinishing || isDestroyed) return@post
+                // Recreate a fresh InputConnection for every new IME session. Some CJK
+                // IMEs retain a stale composing connection after language/layout changes;
+                // English hardware-key delivery can still work while commitText is lost.
+                imm.restartInput(imeProxyView)
                 @Suppress("DEPRECATION")
-                imm.showSoftInput(targetView, InputMethodManager.SHOW_IMPLICIT)
+                imm.showSoftInput(imeProxyView, InputMethodManager.SHOW_IMPLICIT)
             }
         } else {
-            imm.hideSoftInputFromWindow(videoSurfaceView.windowToken, 0)
+            // Request IME dismissal while the proxy is still the served editor, then
+            // release view focus. Reversing this order can leave some CJK IMEs bound
+            // to a stale InputConnection until the next keyboard toggle.
+            imm.hideSoftInputFromWindow(imeProxyView.windowToken, 0)
+            imeProxyView.requestKeyboardInput(false)
+            (application as? MyApplication)?.setImeBridgeActive(this, false)
         }
         Log.d(TAG, "Keyboard ${if (willEnable) "shown" else "hidden"}")
+    }
+
+    private fun closeImeBridge() {
+        if (::imeProxyView.isInitialized) {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+            imm?.hideSoftInputFromWindow(imeProxyView.windowToken, 0)
+            imeProxyView.requestKeyboardInput(false)
+        }
+        (application as? MyApplication)?.setImeBridgeActive(this, false)
+        // Keep ADJUST_NOTHING for the lifetime of this Activity. Restoring it onStop
+        // would reintroduce the same one-off window relayout on the next IME show.
     }
 
     /**
@@ -1223,28 +1274,6 @@ class DisplayActivity : ComponentActivity() {
         return event.x in rect.left..rect.right && event.y in rect.top..rect.bottom
     }
 
-    private fun injectTextViaKeyMap(text: String): Boolean {
-        val kcm = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
-        val events: Array<KeyEvent> = kcm.getEvents(text.toCharArray()) ?: return false
-        lifecycleScope.launch(Dispatchers.Main) {
-            for (event in events.iterator()) {
-                val cleanEvent = KeyEvent(
-                    event.downTime,
-                    event.eventTime,
-                    event.action,
-                    event.keyCode,
-                    event.repeatCount,
-                    event.metaState,
-                    0,
-                    0,
-                    event.flags,
-                    InputDevice.SOURCE_KEYBOARD,
-                )
-                inputController.handleKeyEvent(cleanEvent)
-            }
-        }
-        return true
-    }
 
     private lateinit var backCallback: OnBackPressedCallback
 

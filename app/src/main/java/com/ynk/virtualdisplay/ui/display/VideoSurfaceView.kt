@@ -8,10 +8,6 @@ import android.view.KeyEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import android.view.inputmethod.BaseInputConnection
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputConnection
-import android.view.inputmethod.InputMethodManager
 
 class VideoSurfaceView @JvmOverloads constructor(
     context: Context,
@@ -176,23 +172,21 @@ class VideoSurfaceView @JvmOverloads constructor(
 
     fun getSurface(): Surface? = holder.surface?.takeIf { it.isValid }
 
+    /**
+     * Kept for source compatibility with older callers, but the video SurfaceView must
+     * never own an IME session. Keyboard input is handled by RemoteImeProxyView so the
+     * first IME focus transition cannot alter this SurfaceView's composition layer.
+     */
     fun requestKeyboardInput(enabled: Boolean) {
-        isFocusable = enabled
-        isFocusableInTouchMode = enabled
-        if (enabled) {
-            requestFocus()
-        } else {
-            clearFocus()
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-            imm?.hideSoftInputFromWindow(windowToken, 0)
-        }
+        if (enabled) Log.w(TAG, "Ignoring IME focus request on video SurfaceView; use RemoteImeProxyView")
+        isFocusable = false
+        isFocusableInTouchMode = false
+        if (isFocused) clearFocus()
     }
 
-    fun isKeyboardActive(): Boolean = isFocused
+    fun isKeyboardActive(): Boolean = false
 
-    override fun onCheckIsTextEditor(): Boolean {
-        return isFocusable || super.onCheckIsTextEditor()
-    }
+    override fun onCheckIsTextEditor(): Boolean = false
 
     override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK) return super.onKeyPreIme(keyCode, event)
@@ -200,33 +194,5 @@ class VideoSurfaceView @JvmOverloads constructor(
         return super.onKeyPreIme(keyCode, event)
     }
 
-    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
-        if (!isFocusable) return super.onCreateInputConnection(outAttrs)
-
-        outAttrs.inputType = android.text.InputType.TYPE_CLASS_TEXT or
-            android.text.InputType.TYPE_TEXT_VARIATION_NORMAL
-        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI
-        outAttrs.packageName = context.packageName
-
-        return object : BaseInputConnection(this, false) {
-            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                val str = text?.toString() ?: ""
-                if (str.isNotEmpty()) {
-                    if (inputCallbacks?.injectText(str) == true) return true
-                }
-                return super.commitText(text, newCursorPosition)
-            }
-
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                if (inputCallbacks?.deleteSurroundingText(beforeLength, afterLength) == true) return true
-                return super.deleteSurroundingText(beforeLength, afterLength)
-            }
-
-            override fun sendKeyEvent(event: KeyEvent): Boolean {
-                if (event.keyCode == KeyEvent.KEYCODE_BACK) return super.sendKeyEvent(event)
-                if (inputCallbacks?.injectKeyEvent(event) == true) return true
-                return super.sendKeyEvent(event)
-            }
-        }
-    }
+    override fun onCreateInputConnection(outAttrs: android.view.inputmethod.EditorInfo): android.view.inputmethod.InputConnection? = null
 }

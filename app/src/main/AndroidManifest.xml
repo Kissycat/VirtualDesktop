@@ -24,6 +24,20 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MyApplication">
 
+        <service
+            android:name=".ui.input.RemoteTextInputAccessibilityService"
+            android:label="@string/remote_text_bridge_label"
+            android:description="@string/remote_text_bridge_description"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/remote_text_bridge_accessibility_service" />
+        </service>
+
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -68,6 +82,7 @@
             android:enableOnBackInvokedCallback="false"
             tools:targetApi="tiramisu"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density"
+            android:windowSoftInputMode="adjustNothing"
             android:theme="@style/Theme.MyApplication" />
 
     </application>

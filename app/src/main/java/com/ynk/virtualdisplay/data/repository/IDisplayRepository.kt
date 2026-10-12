@@ -98,6 +98,8 @@ interface IDisplayRepository {
     /** 注入带 DisplayId 的输入事件 */
     suspend fun injectInputWithDisplayId(event: InputEvent, displayId: Int): Result<Boolean>
 
+    /** Inject a committed IME string into the focused editor on a target display. */
+    suspend fun injectTextWithDisplayId(text: String, displayId: Int): Result<Boolean>
 
     /** 获取当前 Daemon 中的活动显示器 ID 列表 */
     suspend fun getActiveDisplayIds(): Result<IntArray>

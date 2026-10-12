@@ -489,6 +489,11 @@ class ConnectionSlot(
     override suspend fun injectInputWithDisplayId(event: InputEvent, displayId: Int): Result<Boolean> =
         remoteDataSource.injectInput(displayId, event, currentVideoWidth, currentVideoHeight)
 
+    override suspend fun injectTextWithDisplayId(text: String, displayId: Int): Result<Boolean> {
+        notifyVideoUserActivity(displayId)
+        return remoteDataSource.injectText(displayId, text)
+    }
+
     override suspend fun getActiveDisplayIds(): Result<IntArray> =
         remoteDataSource.getActiveDisplayIds()
 

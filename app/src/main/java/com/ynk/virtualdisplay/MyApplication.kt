@@ -79,6 +79,8 @@ class MyApplication : Application() {
         var displayId: Int = Display.INVALID_DISPLAY
         var resumed: Boolean = false
         var hasWindowFocus: Boolean = false
+        var imeBridgeActive: Boolean = false
+        var imeFocusLossGrace: Boolean = false
         var attachListener: View.OnAttachStateChangeListener? = null
         var observedTree: ViewTreeObserver? = null
         var focusListener: ViewTreeObserver.OnWindowFocusChangeListener? = null
@@ -111,7 +113,9 @@ class MyApplication : Application() {
 
     private fun recomputePhysicalForegroundLocked() {
         val newForeground = activityStates.values.any { state ->
-            state.displayId == Display.DEFAULT_DISPLAY && state.resumed && state.hasWindowFocus
+            state.displayId == Display.DEFAULT_DISPLAY && (
+                (state.resumed && (state.hasWindowFocus || state.imeFocusLossGrace)) || state.imeBridgeActive
+            )
         }
         val changed = isPhysicalDisplayForeground != newForeground
         if (!changed) return
@@ -139,12 +143,38 @@ class MyApplication : Application() {
         displayId: Int = resolveActivityDisplayId(activity),
         resumed: Boolean? = null,
         hasWindowFocus: Boolean? = null,
+        clearImeBridge: Boolean = false,
     ) {
         synchronized(activityLifecycleLock) {
             val state = activityStates.getOrPut(activity) { ActivityFocusState() }
             state.displayId = displayId
-            if (resumed != null) state.resumed = resumed
-            if (hasWindowFocus != null) state.hasWindowFocus = hasWindowFocus
+            if (resumed != null) {
+                state.resumed = resumed
+                if (!resumed && clearImeBridge) {
+                    state.imeBridgeActive = false
+                    state.imeFocusLossGrace = false
+                } else if (!resumed && !state.imeBridgeActive) {
+                    state.imeFocusLossGrace = false
+                }
+            }
+            if (hasWindowFocus != null) {
+                state.hasWindowFocus = hasWindowFocus
+                if (hasWindowFocus) state.imeFocusLossGrace = false
+            }
+            recomputePhysicalForegroundLocked()
+        }
+    }
+
+    /** Keep physical foreground state stable while our invisible proxy owns an IME session. */
+    fun setImeBridgeActive(activity: Activity, active: Boolean) {
+        synchronized(activityLifecycleLock) {
+            val state = activityStates.getOrPut(activity) { ActivityFocusState() }
+            val wasActive = state.imeBridgeActive
+            state.displayId = resolveActivityDisplayId(activity)
+            state.imeBridgeActive = active && state.displayId == Display.DEFAULT_DISPLAY
+            state.imeFocusLossGrace = !active && wasActive && state.resumed &&
+                state.displayId == Display.DEFAULT_DISPLAY && !state.hasWindowFocus
+            if (state.hasWindowFocus) state.imeFocusLossGrace = false
             recomputePhysicalForegroundLocked()
         }
     }
@@ -168,6 +198,8 @@ class MyApplication : Application() {
                     state.observedTree = null
                     state.hasWindowFocus = false
                     state.displayId = Display.INVALID_DISPLAY
+                    state.imeBridgeActive = false
+                    state.imeFocusLossGrace = false
                     recomputePhysicalForegroundLocked()
                 }
                 if (focusListener != null && observedTree?.isAlive == true) {
@@ -213,10 +245,10 @@ class MyApplication : Application() {
         updateActivityState(activity, hasWindowFocus = decor.hasWindowFocus())
     }
 
-    private fun markActivityResumed(activity: Activity, resumed: Boolean) {
+    private fun markActivityResumed(activity: Activity, resumed: Boolean, clearImeBridge: Boolean = false) {
         val displayId = resolveActivityDisplayId(activity)
         val hasFocus = resumed && runCatching { activity.window.decorView.hasWindowFocus() }.getOrDefault(false)
-        updateActivityState(activity, displayId, resumed = resumed, hasWindowFocus = hasFocus)
+        updateActivityState(activity, displayId, resumed = resumed, hasWindowFocus = hasFocus, clearImeBridge = clearImeBridge)
         if (resumed) {
             // onResume can precede the actual window-focus callback, especially
             // while moving Activities between a physical and a virtual display.
@@ -259,10 +291,10 @@ class MyApplication : Application() {
         ExceptionUtils.setupGlobalCrashHandler()
         Log.i(TAG, "冷启动：初始化 AppSettings 并加载所有模块")
 
-        // Foreground means resumed AND window-focused on the physical default
-        // display. Started Activities are insufficient: under multi-window or
-        // translucent windows an Activity can remain STARTED while another app owns
-        // focus, which must not disable idle-frame comparison.
+        // Normally foreground means resumed and focused on physical display 0.
+        // An active remote-IME bridge is an exception because a floating IME can take
+        // focus or briefly pause this Activity while it still receives committed text.
+        // onStop clears the exception so a real app switch still suspends background work.
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
                 updateActivityState(activity)
@@ -271,7 +303,7 @@ class MyApplication : Application() {
 
             override fun onActivityResumed(activity: Activity) = markActivityResumed(activity, true)
             override fun onActivityPaused(activity: Activity) = markActivityResumed(activity, false)
-            override fun onActivityStopped(activity: Activity) = markActivityResumed(activity, false)
+            override fun onActivityStopped(activity: Activity) = markActivityResumed(activity, false, clearImeBridge = true)
             override fun onActivityDestroyed(activity: Activity) = removeActivityState(activity)
             override fun onActivityStarted(activity: Activity) {
                 updateActivityState(activity)

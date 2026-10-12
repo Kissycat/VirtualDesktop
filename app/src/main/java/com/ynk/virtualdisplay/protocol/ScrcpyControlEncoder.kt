@@ -18,6 +18,7 @@ import java.io.DataOutputStream
 object ScrcpyControlEncoder {
 
     private const val TYPE_INJECT_KEYCODE = 0
+    private const val TYPE_INJECT_TEXT = 1
     private const val TYPE_INJECT_TOUCH_EVENT = 2
     private const val TYPE_INJECT_SCROLL_EVENT = 3
     private const val TYPE_INJECT_MOUSE_EVENT = 23
@@ -41,6 +42,18 @@ object ScrcpyControlEncoder {
         out.writeInt(event.keyCode)
         out.writeInt(event.repeatCount)
         out.writeInt(event.metaState)
+    }
+
+    /**
+     * Send a complete IME commit using scrcpy's native TYPE_INJECT_TEXT framing.
+     * UTF-8 keeps CJK/emoji code points intact on the wire; what the server can
+     * ultimately synthesize is determined by Android's input-event capabilities.
+     */
+    fun encodeText(out: DataOutputStream, text: String) {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        out.writeByte(TYPE_INJECT_TEXT)
+        out.writeInt(bytes.size)
+        out.write(bytes)
     }
 
     /** Write a one-byte control-channel heartbeat. The server consumes it as a no-op. */

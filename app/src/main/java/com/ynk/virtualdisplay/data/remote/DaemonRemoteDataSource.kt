@@ -56,6 +56,9 @@ class DaemonRemoteDataSource(
         displayId: Int, event: InputEvent, screenWidth: Int, screenHeight: Int
     ): Result<Boolean> = controlApi.injectInput(displayId, event, screenWidth, screenHeight)
 
+    suspend fun injectText(displayId: Int, text: String): Result<Boolean> =
+        controlApi.injectText(displayId, text)
+
     // === 视频流 / 镜像切换 ===
 
     // === 守护进程生命周期 ===

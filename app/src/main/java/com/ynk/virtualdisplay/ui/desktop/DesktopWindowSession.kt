@@ -305,6 +305,18 @@ internal class DesktopWindowSession(
         }
     }
 
+    suspend fun injectText(text: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        inputMutex.withLock {
+            val id = displayId
+            if (!started || id < 0) {
+                return@withLock Result.failure(IllegalStateException("Desktop window session is not started"))
+            }
+            if (text.isEmpty()) return@withLock Result.success(true)
+            video.notifyUserActivity()
+            controlApi.injectText(id, text)
+        }
+    }
+
     suspend fun injectKeyCode(keyCode: Int): Result<Boolean> = withContext(Dispatchers.IO) {
         inputMutex.withLock {
             val id = displayId

@@ -8,12 +8,19 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import com.ynk.virtualdisplay.data.repository.IDisplayRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.ynk.virtualdisplay.ui.desktop.DesktopWindowInputRouter
+import com.ynk.virtualdisplay.ui.desktop.DesktopWindowSession
 import android.os.Handler
 import android.os.Looper
+import android.widget.Toast
+import java.util.concurrent.atomic.AtomicBoolean
+import com.ynk.virtualdisplay.ui.input.RemoteTextInputAccessibilityService
 
 class InputController(
     private val repository: IDisplayRepository,
@@ -45,10 +52,172 @@ class InputController(
         private const val ACTION_POINTER_INDEX_SHIFT = 8
     }
 
+    private data class KeyboardTarget(
+        /** Parent desktop/virtual display receiving ordinary scrcpy control messages. */
+        val displayId: Int,
+        /** Actual app display: a child display when a small window owns text focus. */
+        val textTargetDisplayId: Int,
+        val windowSession: DesktopWindowSession?,
+    )
+
+    private sealed class KeyboardCommand(open val target: KeyboardTarget) {
+        data class Key(override val target: KeyboardTarget, val event: KeyEvent) : KeyboardCommand(target)
+        data class Text(override val target: KeyboardTarget, val text: String) : KeyboardCommand(target)
+        data class KeyCode(override val target: KeyboardTarget, val keyCode: Int) : KeyboardCommand(target)
+        data class Delete(override val target: KeyboardTarget, val before: Int, val after: Int) : KeyboardCommand(target)
+    }
+
+    private val keyboardQueue = Channel<KeyboardCommand>(Channel.UNLIMITED)
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val unicodeBridgeNoticeShown = AtomicBoolean(false)
+
     init {
         val prefs = context.getSharedPreferences(DESKTOP_PREFS, Context.MODE_PRIVATE)
         setDesktopCursorSensitivityPercent(prefs.getInt(PREF_CURSOR_SENSITIVITY, 0))
         setDesktopScrollSensitivityPercent(prefs.getInt(PREF_SCROLL_SENSITIVITY, 0))
+        scope.launch(Dispatchers.IO) {
+            for (command in keyboardQueue) {
+                try {
+                    dispatchKeyboardCommand(command)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    Log.e(TAG, "Keyboard input dispatch failed", error)
+                }
+            }
+        }
+    }
+
+    private fun captureKeyboardTarget(): KeyboardTarget? {
+        val displayId = displayIdProvider() ?: return null
+        // The router is process-global because overlays share a host. Always scope it
+        // to this desktop display or a focused window from a different virtual desktop
+        // can steal IME commits even though key input appears to work elsewhere.
+        val window = if (desktopModeEnabled) DesktopWindowInputRouter.focusedSession(displayId) else null
+        return KeyboardTarget(
+            displayId = displayId,
+            textTargetDisplayId = window?.windowDisplayId() ?: displayId,
+            windowSession = window,
+        )
+    }
+
+    private fun enqueueKeyboardCommand(command: KeyboardCommand): Boolean {
+        val result = keyboardQueue.trySend(command).isSuccess
+        if (!result) Log.w(TAG, "Keyboard input queue is closed")
+        return result
+    }
+
+    private suspend fun dispatchKeyboardCommand(command: KeyboardCommand) {
+        when (command) {
+            is KeyboardCommand.Key -> {
+                val result = command.target.windowSession?.injectKeyEvent(command.event)
+                    ?: repository.injectInputWithDisplayId(command.event, command.target.displayId)
+                logKeyboardResult("key action=${command.event.action} code=${command.event.keyCode}", result)
+            }
+            is KeyboardCommand.Text -> {
+                if (command.text.isNotEmpty()) {
+                    // KEYCODE mapping can carry ordinary keyboard characters only; it
+                    // cannot represent arbitrary CJK/emoji. For non-ASCII commits, use
+                    // the explicitly enabled accessibility bridge to insert at the
+                    // focused editor selection on the exact app display. Never pretend
+                    // a successfully written control packet means Chinese was inserted.
+                    val needsUnicodeBridge = command.text.any { it.code > 0x7f }
+                    if (needsUnicodeBridge) {
+                        val targetDisplayId = command.target.textTargetDisplayId
+                        // Settings.Secure changes and AccessibilityService binding are
+                        // asynchronous. Give a just-enabled service a short window to bind
+                        // so the first CJK commit is not dropped on app startup.
+                        var bindWaitMs = 0
+                        while (!RemoteTextInputAccessibilityService.isConnected() && bindWaitMs < 1200) {
+                            delay(100)
+                            bindWaitMs += 100
+                        }
+                        if (!RemoteTextInputAccessibilityService.isConnected()) {
+                            notifyUnicodeBridgeFailure(targetDisplayId)
+                        } else {
+                            // Snapshot hint state before the ordinary SPACE event changes
+                            // the editor. Browser/omnibox nodes can expose hint text through
+                            // node.text; without this snapshot, ACTION_SET_TEXT can turn that
+                            // hint into real content. SPACE also replaces any preselected
+                            // suggestion using the target application's normal input path.
+                            val hintState = RemoteTextInputAccessibilityService
+                                .focusedEditorShowsHint(targetDisplayId)
+                            if (hintState == null) {
+                                // Do not send the sentinel if no focused editable node was
+                                // found; otherwise a failed accessibility lookup could
+                                // leave a stray SPACE in the target application.
+                                notifyUnicodeBridgeFailure(targetDisplayId)
+                            } else {
+                                val spaceAccepted = injectKeyCodeToTarget(command.target, KeyEvent.KEYCODE_SPACE)
+                                if (spaceAccepted) {
+                                    // The scrcpy control message is asynchronous at the device
+                                    // input dispatcher. Let the normal key event update editor
+                                    // state before querying its accessibility node.
+                                    delay(60)
+                                }
+                                val inserted = spaceAccepted && RemoteTextInputAccessibilityService
+                                    .replaceInsertedSpaceWithText(targetDisplayId, command.text, hintState)
+                                if (!inserted) notifyUnicodeBridgeFailure(targetDisplayId)
+                            }
+                        }
+                    } else {
+                        val result = command.target.windowSession?.injectText(command.text)
+                            ?: repository.injectTextWithDisplayId(command.text, command.target.displayId)
+                        logKeyboardResult("text length=${command.text.length}", result)
+                    }
+                }
+            }
+            is KeyboardCommand.KeyCode -> {
+                val result = command.target.windowSession?.injectKeyCode(command.keyCode) ?: run {
+                    val downTime = android.os.SystemClock.uptimeMillis()
+                    val down = KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, command.keyCode, 0)
+                    val up = KeyEvent(downTime, android.os.SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, command.keyCode, 0)
+                    val downResult = repository.injectInputWithDisplayId(down, command.target.displayId)
+                    if (downResult.isFailure) downResult else repository.injectInputWithDisplayId(up, command.target.displayId)
+                }
+                logKeyboardResult("keycode=${command.keyCode}", result)
+            }
+            is KeyboardCommand.Delete -> {
+                repeat(command.before.coerceIn(0, 64)) { injectKeyCodeToTarget(command.target, KeyEvent.KEYCODE_DEL) }
+                repeat(command.after.coerceIn(0, 64)) { injectKeyCodeToTarget(command.target, KeyEvent.KEYCODE_FORWARD_DEL) }
+            }
+        }
+    }
+
+    private suspend fun injectKeyCodeToTarget(target: KeyboardTarget, keyCode: Int): Boolean {
+        val result = target.windowSession?.injectKeyCode(keyCode) ?: run {
+            val downTime = android.os.SystemClock.uptimeMillis()
+            val down = KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0)
+            val up = KeyEvent(downTime, android.os.SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, keyCode, 0)
+            val downResult = repository.injectInputWithDisplayId(down, target.displayId)
+            if (downResult.isFailure) downResult else repository.injectInputWithDisplayId(up, target.displayId)
+        }
+        logKeyboardResult("keycode=$keyCode", result)
+        return result.isSuccess && result.getOrNull() == true
+    }
+
+    private fun logKeyboardResult(operation: String, result: Result<Boolean>) {
+        if (result.isFailure || result.getOrNull() != true) {
+            Log.w(TAG, "Keyboard operation was rejected: $operation", result.exceptionOrNull())
+        }
+    }
+
+    private fun notifyUnicodeBridgeFailure(displayId: Int) {
+        Log.w(
+            TAG,
+            "Unicode input failed on display=$displayId; accessibility bridge connected=" +
+                RemoteTextInputAccessibilityService.isConnected(),
+        )
+        if (!unicodeBridgeNoticeShown.compareAndSet(false, true)) return
+        val message = if (RemoteTextInputAccessibilityService.isConnected()) {
+            "无法找到该虚拟屏幕当前焦点的可编辑控件；此应用可能不支持无障碍文本写入。"
+        } else {
+            "中文和表情输入需要启用“屏幕分身 Unicode 文字输入辅助”：请到系统设置 > 无障碍中开启。未使用剪贴板。"
+        }
+        mainHandler.post {
+            Toast.makeText(appContext, message, Toast.LENGTH_LONG).show()
+        }
     }
 
     enum class DisplayMode {
@@ -728,37 +897,33 @@ class InputController(
     }
 
     fun handleKeyEvent(event: KeyEvent): Boolean {
-        if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) {
-            return false
+        if (event.action == KeyEvent.ACTION_MULTIPLE) {
+            val characters = event.characters
+            return !characters.isNullOrEmpty() && injectText(characters)
         }
-        if (desktopModeEnabled && DesktopWindowInputRouter.focusedSession() != null) {
-            scope.launch(Dispatchers.IO) {
-                DesktopWindowInputRouter.injectKeyEvent(event)
-            }
-            return true
-        }
-        val displayId = displayIdProvider() ?: return false
-        scope.launch(Dispatchers.Main.immediate) {
-            repository.injectInputWithDisplayId(event, displayId)
-        }
-        return true
+        if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) return false
+        val target = captureKeyboardTarget() ?: return false
+        return enqueueKeyboardCommand(KeyboardCommand.Key(target, KeyEvent(event)))
+    }
+
+    fun injectText(text: String): Boolean {
+        if (text.isEmpty()) return true
+        val target = captureKeyboardTarget() ?: return false
+        return enqueueKeyboardCommand(KeyboardCommand.Text(target, text))
+    }
+
+    fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+        val target = captureKeyboardTarget() ?: return false
+        return enqueueKeyboardCommand(KeyboardCommand.Delete(
+            target,
+            beforeLength.coerceAtLeast(0),
+            afterLength.coerceAtLeast(0),
+        ))
     }
 
     fun injectKey(keyCode: Int) {
-        if (desktopModeEnabled && DesktopWindowInputRouter.focusedSession() != null) {
-            scope.launch(Dispatchers.IO) {
-                DesktopWindowInputRouter.injectKeyCode(keyCode)
-            }
-            return
-        }
-        val displayId = displayIdProvider() ?: return
-        val now = android.os.SystemClock.uptimeMillis()
-        val downEvent = KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0)
-        val upEvent = KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0)
-        scope.launch(Dispatchers.Main.immediate) {
-            repository.injectInputWithDisplayId(downEvent, displayId)
-            repository.injectInputWithDisplayId(upEvent, displayId)
-        }
+        val target = captureKeyboardTarget() ?: return
+        enqueueKeyboardCommand(KeyboardCommand.KeyCode(target, keyCode))
     }
 
     private fun isMouseEvent(event: MotionEvent): Boolean {

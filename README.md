@@ -70,3 +70,10 @@ This path reuses the existing H.264 encoder. The Android side does not add a sec
 ### Freeform chrome provenance
 
 The client-side desktop window chrome in `app/src/main/java/com/ynk/virtualdisplay/ui/desktop/FreeformOverlayDecoration.kt` is a port of the LMOFreeform interaction model and visual structure. The original LMOFreeform project is licensed under the GNU General Public License v3 or later; the corresponding license text is included as `LICENSE-LMOFREEFORM-GPL.txt`. Review the combined licensing requirements before redistributing a build containing this code.
+
+
+## 中文与 emoji 输入说明
+
+普通英文/ASCII 输入继续通过 scrcpy 键盘事件路径。Android 的 `KeyCharacterMap` 无法把任意 CJK 字符或 emoji 表示成普通物理按键，因此非 ASCII 的已提交文本改走可选的 `RemoteTextInputAccessibilityService`：它只在收到明确的文本插入请求时，查找目标虚拟显示器当前聚焦的可编辑节点，并在当前选区处插入文字；不读取/记录其他文本事件，也不使用系统剪贴板。
+
+首次输入中文/emoji 前，请在系统“设置 → 无障碍”中手动启用“屏幕分身 Unicode 文字输入辅助”。如果目标 APP 没有向无障碍公开可编辑节点，服务会记录失败并提示，而不会假装已经输入成功。窗口的 `adjustNothing` 也已改为 Activity 创建前的 manifest 配置，避免首次打开输入法时才修改窗口软输入模式。

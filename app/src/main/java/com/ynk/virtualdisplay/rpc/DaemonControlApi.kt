@@ -42,6 +42,7 @@ interface DaemonControlApi {
      * @param screenHeight 视频表面高度 (像素，用于位置编码)
      */
     suspend fun injectInput(displayId: Int, event: InputEvent, screenWidth: Int, screenHeight: Int): Result<Boolean>
+    suspend fun injectText(displayId: Int, text: String): Result<Boolean>
     suspend fun injectMouseEvent(displayId: Int, action: Int, pointerId: Long, x: Int, y: Int, screenWidth: Int, screenHeight: Int, actionButton: Int, buttons: Int): Result<Boolean>
     suspend fun exitDaemon(): Result<Unit>
     suspend fun getRotation(displayId: Int): Result<Int>
@@ -255,6 +256,15 @@ class DaemonControlApiImpl(
     }
 
 
+
+    override suspend fun injectText(displayId: Int, text: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        if (text.isEmpty()) return@withContext Result.success(true)
+        val ok = transport.writeControlMessage { stream ->
+            ScrcpyControlEncoder.encodeText(stream, text)
+        }
+        if (ok) Result.success(true)
+        else Result.failure(IOException("Failed to write IME text to ROLE_CONTROL socket (displayId=$displayId)"))
+    }
 
     override suspend fun exitDaemon(): Result<Unit> {
         val msg = ControlMessage.ExitDaemon

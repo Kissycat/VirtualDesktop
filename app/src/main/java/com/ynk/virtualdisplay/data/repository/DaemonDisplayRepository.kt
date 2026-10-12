@@ -544,11 +544,21 @@ class DaemonDisplayRepository(
     }
 
     override suspend fun injectInputWithDisplayId(event: InputEvent, displayId: Int): Result<Boolean> {
-        // Post-b7aef962: 直接通过 ROLE_CONTROL socket 上的 scrcpy 原生协议发送。
-        // 不再需要 Parcel marshalling —— 输入事件由 ScrcpyControlEncoder 编码。
+        // Direct scrcpy-native control protocol through ROLE_CONTROL.
         val result = remoteDataSource.injectInput(displayId, event, currentVideoWidth, currentVideoHeight)
         if (result.isFailure) {
             Log.w(TAG, "injectInputWithDisplay(displayId=$displayId) failed: ${result.exceptionOrNull()?.message}")
+        }
+        return result
+    }
+
+    override suspend fun injectTextWithDisplayId(text: String, displayId: Int): Result<Boolean> {
+        // Treat committed text like other input so local idle-preview policies do
+        // not enter a freeze window while the user is actively typing.
+        notifyVideoUserActivity(displayId)
+        val result = remoteDataSource.injectText(displayId, text)
+        if (result.isFailure) {
+            Log.w(TAG, "injectTextWithDisplay(displayId=$displayId) failed: ${result.exceptionOrNull()?.message}")
         }
         return result
     }

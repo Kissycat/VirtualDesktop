@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">屏幕分身</string>
+    <string name="remote_text_bridge_label">屏幕分身 Unicode 文字输入辅助</string>
+    <string name="remote_text_bridge_description">仅在屏幕分身明确请求时，将输入法已提交的中文、符号和表情插入指定虚拟显示器当前聚焦的可编辑控件。不会读取或保存其他输入内容，不使用或修改系统剪贴板。</string>
 </resources>

@@ -1,10 +1,13 @@
 package com.ynk.virtualdisplay.ui.main
 
 import android.os.Bundle
+import android.content.pm.PackageManager
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -35,6 +38,11 @@ import com.ynk.virtualdisplay.ui.screens.ShizukuPermissionScreen
 import com.ynk.virtualdisplay.ui.screens.VirtualDisplayScreen
 import com.ynk.virtualdisplay.ui.theme.MyApplicationTheme
 import org.koin.android.ext.android.inject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.ynk.virtualdisplay.ui.input.AccessibilityServiceBootstrap
 import rikka.shizuku.Shizuku
 import rikka.sui.Sui
 
@@ -45,9 +53,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private val shizukuManager: ShizukuManager by inject()
+    private var accessibilityBootstrapJob: Job? = null
+    private var accessibilityFailureToastShown = false
+
+    private val shizukuPermissionResultListener = Shizuku.OnRequestPermissionResultListener { _, result ->
+        if (result == PackageManager.PERMISSION_GRANTED) ensureUnicodeAccessibilityEnabled()
+    }
+    private val shizukuBinderListener = Shizuku.OnBinderReceivedListener {
+        ensureUnicodeAccessibilityEnabled()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionResultListener)
+        Shizuku.addBinderReceivedListener(shizukuBinderListener)
 
         try {
             if (Sui.init(packageName)) {
@@ -80,7 +99,45 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Keep this idempotent: if Shizuku is already authorized, the service is
+        // enabled automatically; if the user grants Shizuku while this Activity is
+        // open, the permission-result listener above retries immediately.
+        ensureUnicodeAccessibilityEnabled()
+    }
+
+    private fun ensureUnicodeAccessibilityEnabled() {
+        if (!runCatching { Shizuku.pingBinder() }.getOrDefault(false)) return
+        if (!runCatching { Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED }.getOrDefault(false)) return
+        if (accessibilityBootstrapJob?.isActive == true) return
+
+        accessibilityBootstrapJob = lifecycleScope.launch(Dispatchers.IO) {
+            when (val result = AccessibilityServiceBootstrap.ensureEnabled(applicationContext)) {
+                AccessibilityServiceBootstrap.Result.Enabled ->
+                    Log.i(TAG, "Unicode accessibility input is enabled through Shizuku")
+                AccessibilityServiceBootstrap.Result.ShizukuUnavailable -> Unit
+                is AccessibilityServiceBootstrap.Result.Failed -> {
+                    Log.e(TAG, "Automatic accessibility enable failed: ${result.reason}")
+                    withContext(Dispatchers.Main) {
+                        if (!accessibilityFailureToastShown && !isFinishing) {
+                            accessibilityFailureToastShown = true
+                            Toast.makeText(
+                                this@MainActivity,
+                                "无法通过 Shizuku 自动启用 Unicode 输入辅助，请检查 Shizuku 是否有修改安全设置的权限。",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     override fun onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionResultListener)
+        Shizuku.removeBinderReceivedListener(shizukuBinderListener)
+        accessibilityBootstrapJob?.cancel()
         super.onDestroy()
     }
 }

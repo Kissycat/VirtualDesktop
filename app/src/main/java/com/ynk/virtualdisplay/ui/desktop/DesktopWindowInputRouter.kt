@@ -117,8 +117,10 @@ internal object DesktopWindowInputRouter {
         Log.d(TAG, "focus cleared")
     }
 
-    fun focusedSession(): DesktopWindowSession? = synchronized(lock) {
-        focusedTarget?.get()?.takeIf { entries.containsKey(it) }
+    fun focusedSession(parentDisplayId: Int? = null): DesktopWindowSession? = synchronized(lock) {
+        val session = focusedTarget?.get()?.takeIf { entries.containsKey(it) } ?: return@synchronized null
+        val entry = entries[session] ?: return@synchronized null
+        if (parentDisplayId == null || entry.displayId == parentDisplayId) session else null
     }
 
     fun focusSession(session: DesktopWindowSession, promote: Boolean = true) {
