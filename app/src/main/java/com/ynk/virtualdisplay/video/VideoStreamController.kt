@@ -49,6 +49,7 @@ class VideoStreamController(
     private val backgroundWakePending = java.util.concurrent.atomic.AtomicBoolean(false)
     private val idlePolicyMutex = Mutex()
     private val lastUserActivityMs = java.util.concurrent.atomic.AtomicLong(0L)
+    private val freezeProtectionUntilMs = java.util.concurrent.atomic.AtomicLong(0L)
     // Unlike arbitrary device touches, this timestamp is updated only when input
     // is routed through the virtual-display operation surface (or an explicit
     // local-preview action).
@@ -573,7 +574,12 @@ class VideoStreamController(
      * Physical-screen focus is deliberately irrelevant: unrelated touches in other
      * apps never call this method, while genuine input to the virtual screen must
      * wake it even when its Activity lives on a virtual display. */
-    fun notifyUserActivity() {
+    fun notifyUserActivity(freezeProtectionMs: Long = 0L) {
+        if (freezeProtectionMs > 0L) {
+            val until = android.os.SystemClock.elapsedRealtime() +
+                freezeProtectionMs.coerceAtMost(60_000L)
+            freezeProtectionUntilMs.updateAndGet { previous -> maxOf(previous, until) }
+        }
         resumeFromUserActivity()
     }
 
@@ -596,16 +602,15 @@ class VideoStreamController(
                 val appInForeground = MyApplication.isPhysicalDisplayForeground
                 val idleFor = now - lastUserActivityMs.get()
                 val virtualInputAge = now - lastVirtualInputMs.get()
+                val freezeProtectionRemaining = freezeProtectionUntilMs.get() - now
                 val recentVirtualInput = virtualInputAge < USER_INPUT_GRACE_MS
 
                 // Keep the foreground/idle check as a race guard while a lifecycle
                 // transition is waiting for the controller mutex. If GO is active,
                 // the normal worker remains alive and the existing policy continues.
-                val shouldMonitorNow = if (appInForeground) {
-                    idleFor >= USER_INPUT_GRACE_MS
-                } else {
-                    !recentVirtualInput
-                }
+                val shouldMonitorNow = freezeProtectionRemaining <= 0L && (
+                    if (appInForeground) idleFor >= USER_INPUT_GRACE_MS else !recentVirtualInput
+                )
 
                 if (shouldMonitorNow) {
                     if (idleFreezeArmed.compareAndSet(false, true)) {
@@ -616,9 +621,11 @@ class VideoStreamController(
                             val foregroundIdle = checkTime - lastUserActivityMs.get() >= USER_INPUT_GRACE_MS
                             val backgroundVirtualInputRecent =
                                 checkTime - lastVirtualInputMs.get() < USER_INPUT_GRACE_MS
+                            val inFreezeProtection = checkTime < freezeProtectionUntilMs.get()
                             val startupReady = firstVisibleFrameRendered.get() &&
                                 checkTime >= idleMonitoringNotBeforeMs.get()
-                            val shouldMonitor = startupReady && running && currentDisplayId == displayId &&
+                            val shouldMonitor = startupReady && !inFreezeProtection &&
+                                running && currentDisplayId == displayId &&
                                 (if (isForegroundNow) foregroundIdle else !backgroundVirtualInputRecent)
 
                             if (shouldMonitor) {
@@ -637,7 +644,11 @@ class VideoStreamController(
                     delay(1_000L)
                 } else {
                     // Poll the next eligible activity boundary without delaying active input.
-                    val graceRemaining = if (appInForeground) {
+                    // IME activation temporarily overrides the normal idle timer; continue
+                    // checking at a low rate and re-arm freezing only after the 10s window.
+                    val graceRemaining = if (freezeProtectionRemaining > 0L) {
+                        freezeProtectionRemaining
+                    } else if (appInForeground) {
                         USER_INPUT_GRACE_MS - idleFor
                     } else {
                         USER_INPUT_GRACE_MS - virtualInputAge

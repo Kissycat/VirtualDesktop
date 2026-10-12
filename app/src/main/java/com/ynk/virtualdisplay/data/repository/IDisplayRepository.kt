@@ -77,8 +77,11 @@ interface IDisplayRepository {
     /** Enable/disable local video decoding without reconnecting video/control sockets. */
     suspend fun setLocalVideoDecodeEnabled(displayId: Int, enabled: Boolean): Result<Unit> = Result.success(Unit)
 
-    /** Notify the active video stream that the user interacted with the UI. */
-    fun notifyVideoUserActivity(displayId: Int) {}
+    /** Notify the active video stream that the user interacted with the UI.
+     * [freezeProtectionMs] extends the normal idle grace period (for example, when
+     * opening an IME that needs several seconds to settle on the physical screen).
+     */
+    fun notifyVideoUserActivity(displayId: Int, freezeProtectionMs: Long = 0L) {}
 
     /** 重新调整指定虚拟显示器的物理尺寸和 DPI */
     suspend fun resizeDisplay(displayId: Int, width: Int, height: Int, dpi: Int): Result<Unit>

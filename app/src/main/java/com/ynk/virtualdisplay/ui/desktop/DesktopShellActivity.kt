@@ -1,6 +1,17 @@
 package com.ynk.virtualdisplay.ui.desktop
 
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.media.AudioManager
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
+import android.os.Build
+import android.content.pm.PackageManager
+import android.widget.Switch
 import android.app.ActivityOptions
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -222,6 +233,53 @@ class DesktopShellActivity : ComponentActivity() {
     private var desktopTaskbar: View? = null
     private var dockClock: TextView? = null
     private var dockClockJob: Job? = null
+    private var dockStatusStrip: LinearLayout? = null
+    private val dockStatusIcons = LinkedHashMap<DockStatusKind, DockStatusIconView>()
+    private var quickPanelWindowManager: WindowManager? = null
+    private var quickPanelRoot: View? = null
+    private var quickPanelParams: WindowManager.LayoutParams? = null
+    private var quickPanelKind: QuickPanelKind? = null
+    private var quickPanelTrigger: View? = null
+    private var pendingBluetoothTrigger: View? = null
+    private var batteryStatusText: TextView? = null
+    private var bluetoothDevicesText: TextView? = null
+    private var batteryLevelPercent: Int = 100
+    private var batteryIsCharging: Boolean = false
+    private var bluetoothBatteryByAddress = LinkedHashMap<String, Pair<String, Int>>()
+    private var brightnessWriteJob: Job? = null
+    private var dockStatusReceiverRegistered = false
+
+    private enum class QuickPanelKind { AUDIO, BATTERY, WIFI, BLUETOOTH }
+
+    private val dockSystemStatusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_BATTERY_CHANGED -> updateDockBatteryFromIntent(intent)
+                ACTION_BLUETOOTH_BATTERY_LEVEL_CHANGED -> {
+                    val level = intent.getIntExtra(EXTRA_BLUETOOTH_BATTERY_LEVEL, -1)
+                    if (level in 0..100) {
+                        val device = runCatching {
+                            if (Build.VERSION.SDK_INT >= 33) {
+                                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                            }
+                        }.getOrNull()
+                        val address = runCatching { device?.address }.getOrNull() ?: "unknown-${bluetoothBatteryByAddress.size}"
+                        val name = runCatching { device?.name }.getOrNull()?.takeIf { it.isNotBlank() }
+                            ?: "蓝牙设备 ${bluetoothBatteryByAddress.size + 1}"
+                        bluetoothBatteryByAddress[address] = name to level
+                        refreshBluetoothBatteryIndicator()
+                    }
+                }
+            }
+        }
+    }
+
+    private val ACTION_BLUETOOTH_BATTERY_LEVEL_CHANGED = "android.bluetooth.device.action.BATTERY_LEVEL_CHANGED"
+    private val EXTRA_BLUETOOTH_BATTERY_LEVEL = "android.bluetooth.device.extra.BATTERY_LEVEL"
+    private val REQUEST_DOCK_BLUETOOTH_CONNECT = 7406
     private var dockOverlayWindowManager: WindowManager? = null
     private var dockOverlayAttached = false
     private var dockOverlayVisible = false
@@ -259,7 +317,8 @@ class DesktopShellActivity : ComponentActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.BOTTOM
-            setPadding(dp(24), dp(18), dp(24), dp(18))
+            val horizontalPadding = dp(if (isCompactDesktopUi()) 8 else 24)
+            setPadding(horizontalPadding, dp(18), horizontalPadding, dp(18))
             background = createWallpaperDrawable()
             // Desktop-level settings are now opened from the Dock clock.
             // Keep the wallpaper itself free of the old right-click menu so
@@ -280,15 +339,16 @@ class DesktopShellActivity : ComponentActivity() {
         val taskbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            val horizontalPadding = dp(if (isCompactDesktopUi()) 4 else 10)
+            setPadding(horizontalPadding, dp(8), horizontalPadding, dp(8))
             background = rounded(0xE01B1F26.toInt(), 18f)
             elevation = dp(8).toFloat()
         }
 
         lateinit var launcher: TextView
         launcher = button("☰  应用") { showAppLauncher() }
-        taskbar.addView(launcher, LinearLayout.LayoutParams(dp(150), dp(52)).apply {
-            marginEnd = dp(10)
+        taskbar.addView(launcher, LinearLayout.LayoutParams(dp(if (isCompactDesktopUi()) 68 else 150), dp(52)).apply {
+            marginEnd = dp(if (isCompactDesktopUi()) 5 else 10)
         })
 
         val taskScroll = android.widget.HorizontalScrollView(this).apply {
@@ -305,19 +365,39 @@ class DesktopShellActivity : ComponentActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)
         ))
         taskbar.addView(taskScroll, LinearLayout.LayoutParams(0, dp(52), 1f).apply {
-            marginEnd = dp(8)
+            marginEnd = dp(4)
         })
+
+        val statusStrip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        addDockStatusButton(statusStrip, DockStatusKind.NOTIFICATIONS, "通知") {
+            if (!com.ynk.virtualdisplay.ui.input.RemoteTextInputAccessibilityService.expandNotifications()) {
+                Toast.makeText(this, "无障碍服务未连接，无法展开通知面板", Toast.LENGTH_SHORT).show()
+            }
+        }
+        addDockStatusButton(statusStrip, DockStatusKind.AUDIO, "音量与亮度") { trigger ->
+            showQuickSettingsPanel(trigger, QuickPanelKind.AUDIO)
+        }
+        addDockStatusButton(statusStrip, DockStatusKind.BATTERY, "电池") { trigger ->
+            showQuickSettingsPanel(trigger, QuickPanelKind.BATTERY)
+        }
+        dockStatusStrip = statusStrip
+        taskbar.addView(statusStrip, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)
+        ).apply { marginEnd = dp(if (isCompactDesktopUi()) 1 else 3) })
 
         val clock = TextView(this).apply {
             text = currentDockClockText()
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isCompactDesktopUi()) 12f else 15f)
             gravity = Gravity.CENTER
             alpha = 0.9f
             isClickable = true
             setOnClickListener { showDesktopSettingsMenu(this) }
         }
-        taskbar.addView(clock, LinearLayout.LayoutParams(dp(90), dp(52)))
+        taskbar.addView(clock, LinearLayout.LayoutParams(dp(if (isCompactDesktopUi()) 54 else 90), dp(52)))
 
         dockClock = clock
         startDockClockUpdates()
@@ -354,6 +434,8 @@ class DesktopShellActivity : ComponentActivity() {
 
         ensureDockOverlayAttached()
         syncDockVisibility()
+        registerDockSystemStatusReceiver()
+        refreshDockBatteryIndicators()
 
         getSystemService(android.hardware.display.DisplayManager::class.java)
             ?.registerDisplayListener(desktopDisplayListener, null)
@@ -366,6 +448,10 @@ class DesktopShellActivity : ComponentActivity() {
      */
     private fun refreshDesktopDisplayGeometry() {
         if (isFinishing || isDestroyed) return
+        // A bubble is anchored to a specific Dock icon coordinate. Recreate it on the
+        // next click after virtual-display geometry/density changes rather than leave
+        // it detached from the icon it points to.
+        if (quickPanelRoot != null) dismissQuickSettingsPanel()
         val targetDisplay = display ?: return
         val width = targetDisplay.width
         val height = targetDisplay.height
@@ -445,6 +531,476 @@ class DesktopShellActivity : ComponentActivity() {
     internal fun desktopDpiPublic(): Int = desktopPrefs.getInt(PREF_DESKTOP_DPI, 160)
     internal fun desktopDockHeightPublic(): Int = dp(68)
 
+    private fun isCompactDesktopUi(): Boolean {
+        val displayWidthDp = (display?.width ?: resources.displayMetrics.widthPixels) /
+            resources.displayMetrics.density.coerceAtLeast(0.5f)
+        return displayWidthDp < 760f
+    }
+
+    private fun addDockStatusButton(
+        parent: LinearLayout,
+        kind: DockStatusKind,
+        label: String,
+        onClick: (View) -> Unit,
+    ) {
+        val icon = DockStatusIconView(this, kind).apply {
+            contentDescription = label
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        }
+        val button = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = label
+            background = rounded(0x40394352.toInt(), 12f)
+            setOnClickListener { onClick(this) }
+            // Size the drawable to the actual button box. DockStatusIconView then
+            // scales its widest glyph (the speaker arcs) to this view's real bounds.
+            addView(icon, FrameLayout.LayoutParams(dp(if (isCompactDesktopUi()) 22 else 30), dp(if (isCompactDesktopUi()) 22 else 30), Gravity.CENTER))
+        }
+        dockStatusIcons[kind] = icon
+        val compact = isCompactDesktopUi()
+        button.minimumWidth = dp(if (compact) 30 else 42)
+        button.minimumHeight = dp(if (compact) 34 else 44)
+        parent.addView(button, LinearLayout.LayoutParams(dp(if (compact) 31 else 42), dp(if (compact) 36 else 46)).apply {
+            marginStart = dp(1)
+            marginEnd = dp(1)
+        })
+    }
+
+    private fun updateDockBatteryFromIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_BATTERY_CHANGED) return
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+        if (level >= 0) batteryLevelPercent = (level * 100 / scale).coerceIn(0, 100)
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN)
+        batteryIsCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+        refreshDockBatteryIndicators()
+    }
+
+    private fun registerDockSystemStatusReceiver() {
+        if (dockStatusReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(ACTION_BLUETOOTH_BATTERY_LEVEL_CHANGED)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(dockSystemStatusReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(dockSystemStatusReceiver, filter)
+            }
+            dockStatusReceiverRegistered = true
+            // ACTION_BATTERY_CHANGED is sticky, but explicitly query its current value
+            // instead of relying on whether this Android build immediately redelivers it.
+            runCatching { registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) }
+                .getOrNull()
+                ?.let(::updateDockBatteryFromIntent)
+        } catch (error: Throwable) {
+            Log.w("DesktopShell", "Unable to register Dock status receiver", error)
+        }
+    }
+
+    private fun unregisterDockSystemStatusReceiver() {
+        if (!dockStatusReceiverRegistered) return
+        runCatching { unregisterReceiver(dockSystemStatusReceiver) }
+        dockStatusReceiverRegistered = false
+    }
+
+    private fun refreshDockBatteryIndicators() {
+        dockStatusIcons[DockStatusKind.BATTERY]?.setBatteryLevel(batteryLevelPercent)
+        batteryStatusText?.text = buildString {
+            append("电量：$batteryLevelPercent%")
+            append(if (batteryIsCharging) " · 正在充电" else " · 使用电池")
+        }
+    }
+
+    private fun refreshBluetoothBatteryIndicator() {
+        val hasBattery = bluetoothBatteryByAddress.isNotEmpty()
+        bluetoothDevicesText?.text = if (hasBattery) {
+            bluetoothBatteryByAddress.values.joinToString("\n") { (name, level) -> "$name：$level%" }
+        } else {
+            "暂无可读取电量的蓝牙设备"
+        }
+    }
+
+    private fun requestBluetoothPermissionOrShow(trigger: View) {
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            pendingBluetoothTrigger = trigger
+            requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), REQUEST_DOCK_BLUETOOTH_CONNECT)
+            return
+        }
+        showQuickSettingsPanel(trigger, QuickPanelKind.BLUETOOTH)
+    }
+
+    @Deprecated("Deprecated in Android API 23")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_DOCK_BLUETOOTH_CONNECT) {
+            val trigger = pendingBluetoothTrigger
+            pendingBluetoothTrigger = null
+            if (trigger != null && !isFinishing && !isDestroyed) {
+                if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                    showQuickSettingsPanel(trigger, QuickPanelKind.BLUETOOTH)
+                } else {
+                    showQuickSettingsPanel(trigger, QuickPanelKind.BLUETOOTH)
+                    Toast.makeText(this, "未授权设备信息，蓝牙电量可能不可用", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun showQuickSettingsPanel(trigger: View, kind: QuickPanelKind) {
+        if (quickPanelRoot != null && quickPanelKind == kind && quickPanelTrigger === trigger) {
+            dismissQuickSettingsPanel()
+            return
+        }
+        dismissQuickSettingsPanel()
+        if (!ensureOverlayPermissionSilently()) {
+            Toast.makeText(this, "无法创建桌面设置气泡：缺少悬浮窗权限", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val targetDisplay = display ?: return
+        val displayContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            createDisplayContext(targetDisplay).createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
+        } else createDisplayContext(targetDisplay)
+        val wm = displayContext.getSystemService(WindowManager::class.java) ?: return
+        val usableWidth = (targetDisplay.width - dp(16)).coerceAtLeast(dp(120))
+        val widthPx = minOf(dp(292), usableWidth)
+        val triggerLocation = IntArray(2)
+        trigger.getLocationOnScreen(triggerLocation)
+        val screenWidth = targetDisplay.width
+        val centerX = triggerLocation[0] + trigger.width / 2
+        val x = (centerX - widthPx / 2).coerceIn(dp(8), (screenWidth - widthPx - dp(8)).coerceAtLeast(dp(8)))
+        val tailCenterX = (centerX - x).coerceIn(dp(15), (widthPx - dp(15)).coerceAtLeast(dp(15))).toFloat()
+        val root = createQuickSettingsBubble(kind, widthPx, tailCenterX)
+        val maxHeight = (targetDisplay.height - dp(36)).coerceAtLeast(dp(170))
+        root.measure(
+            View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(maxHeight, View.MeasureSpec.AT_MOST),
+        )
+        val heightPx = root.measuredHeight.coerceIn(dp(120), maxHeight)
+        val y = (triggerLocation[1] - heightPx - dp(5)).coerceAtLeast(dp(6))
+        val params = WindowManager.LayoutParams(
+            widthPx,
+            heightPx,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y
+            title = "VirtualDisplay Dock Quick Settings: $kind"
+        }
+        root.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_OUTSIDE) {
+                dismissQuickSettingsPanel()
+                true
+            } else false
+        }
+        runCatching {
+            wm.addView(root, params)
+            quickPanelWindowManager = wm
+            quickPanelRoot = root
+            quickPanelParams = params
+            quickPanelKind = kind
+            quickPanelTrigger = trigger
+        }.onFailure {
+            Log.w("DesktopShell", "Failed to show quick settings bubble $kind", it)
+            Toast.makeText(this, "设置气泡显示失败", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun dismissQuickSettingsPanel() {
+        val root = quickPanelRoot
+        val wm = quickPanelWindowManager
+        if (root != null && wm != null) {
+            runCatching { wm.removeViewImmediate(root) }
+                .onFailure { Log.d("DesktopShell", "Quick settings bubble already removed", it) }
+        }
+        quickPanelRoot = null
+        quickPanelWindowManager = null
+        quickPanelParams = null
+        quickPanelKind = null
+        quickPanelTrigger = null
+        batteryStatusText = null
+        bluetoothDevicesText = null
+    }
+
+    private fun createQuickSettingsBubble(kind: QuickPanelKind, widthPx: Int, tailCenterX: Float): View {
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(Color.TRANSPARENT)
+            isClickable = true
+        }
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(12))
+            background = rounded(0xF2262D38.toInt(), 16f)
+            elevation = dp(12).toFloat()
+            isClickable = true
+            layoutParams = LinearLayout.LayoutParams(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = TextView(this).apply {
+            text = when (kind) {
+                QuickPanelKind.AUDIO -> "音量与亮度"
+                QuickPanelKind.BATTERY -> "电池状态"
+                QuickPanelKind.WIFI -> "Wi-Fi 设置"
+                QuickPanelKind.BLUETOOTH -> "蓝牙设置"
+            }
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(title, LinearLayout.LayoutParams(0, dp(30), 1f))
+        val close = TextView(this).apply {
+            text = "×"
+            setTextColor(0xFFD7DEE8.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            gravity = Gravity.CENTER
+            isClickable = true
+            setOnClickListener { dismissQuickSettingsPanel() }
+        }
+        header.addView(close, LinearLayout.LayoutParams(dp(30), dp(30)))
+        panel.addView(header)
+
+        when (kind) {
+            QuickPanelKind.AUDIO -> buildAudioPanel(panel)
+            QuickPanelKind.BATTERY -> {
+                batteryStatusText = TextView(this).apply {
+                    setTextColor(0xFFE4EAF2.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    setPadding(0, dp(8), 0, dp(5))
+                }
+                panel.addView(batteryStatusText, LinearLayout.LayoutParams(-1, dp(38)))
+                val hint = TextView(this).apply {
+                    text = "电池图标中的数字为当前电量百分比。"
+                    setTextColor(0xFFAFBAC9.toInt())
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                }
+                panel.addView(hint)
+                addPanelAction(panel, "打开系统电池设置") {
+                    launchSettingsOnDesktop(Intent(Intent.ACTION_POWER_USAGE_SUMMARY))
+                }
+                refreshDockBatteryIndicators()
+            }
+            QuickPanelKind.WIFI -> buildWifiPanel(panel)
+            QuickPanelKind.BLUETOOTH -> buildBluetoothPanel(panel)
+        }
+        outer.addView(panel)
+        outer.addView(BubbleTailView(this, tailCenterX), LinearLayout.LayoutParams(widthPx, dp(12)))
+        outer.layoutParams = ViewGroup.LayoutParams(widthPx, ViewGroup.LayoutParams.WRAP_CONTENT)
+        outer.measure(
+            View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec((display?.height ?: 1080) - dp(24), View.MeasureSpec.AT_MOST),
+        )
+        return outer
+    }
+
+    private fun buildAudioPanel(panel: LinearLayout) {
+        val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+        addPanelLabel(panel, "媒体音量")
+        val maxVolume = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val volumeSlider = SeekBar(this).apply {
+            max = maxVolume
+            progress = audio.getStreamVolume(AudioManager.STREAM_MUSIC).coerceIn(0, maxVolume)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) runCatching { audio.setStreamVolume(AudioManager.STREAM_MUSIC, progress, 0) }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        panel.addView(volumeSlider, LinearLayout.LayoutParams(-1, dp(36)))
+        addPanelLabel(panel, "屏幕亮度")
+        val currentBrightness = runCatching {
+            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
+        }.getOrDefault(128)
+        val brightnessSlider = SeekBar(this).apply {
+            max = 255
+            progress = currentBrightness.coerceIn(1, 255)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    brightnessWriteJob?.cancel()
+                    brightnessWriteJob = lifecycleScope.launch {
+                        delay(180L)
+                        val value = progress.coerceIn(1, 255)
+                        val applied = withContext(Dispatchers.IO) {
+                            val localWriteSucceeded = Settings.System.canWrite(this@DesktopShellActivity) &&
+                                runCatching {
+                                    Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL) &&
+                                        Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, value)
+                                }.getOrDefault(false)
+                            localWriteSucceeded || executeQuickSettingsShell(
+                                "settings put system screen_brightness_mode 0 && settings put system screen_brightness $value"
+                            )
+                        }
+                        if (!applied) Log.w("DesktopShell", "Brightness change needs WRITE_SETTINGS or authorized Shizuku")
+                    }
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+            })
+        }
+        panel.addView(brightnessSlider, LinearLayout.LayoutParams(-1, dp(36)))
+    }
+
+    private fun buildWifiPanel(panel: LinearLayout) {
+        val wifi = getSystemService(WIFI_SERVICE) as? WifiManager
+        val switch = Switch(this).apply {
+            text = "启用 Wi-Fi"
+            setTextColor(0xFFE8EDF5.toInt())
+            textSize = 12f
+            isChecked = runCatching { wifi?.isWifiEnabled == true }.getOrDefault(false)
+        }
+        switch.setOnCheckedChangeListener { _, enabled ->
+            switch.isEnabled = false
+            val command = if (enabled) "svc wifi enable" else "svc wifi disable"
+            runQuickSettingsCommand(listOf(command)) { success ->
+                switch.isEnabled = true
+                if (success) {
+                    switch.isChecked = enabled
+                } else {
+                    switch.isChecked = runCatching { wifi?.isWifiEnabled == true }.getOrDefault(!enabled)
+                    Toast.makeText(this, "Wi-Fi 设置失败；请确认 Shizuku 已授权", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        panel.addView(switch, LinearLayout.LayoutParams(-1, dp(42)))
+        val note = TextView(this).apply {
+            text = "通过系统服务切换无线网络。连接网络等高级选项可在系统 Wi-Fi 设置中管理。"
+            setTextColor(0xFFAFBAC9.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+        }
+        panel.addView(note)
+        addPanelAction(panel, "打开系统 Wi-Fi 设置") {
+            launchSettingsOnDesktop(Intent(Settings.ACTION_WIFI_SETTINGS))
+        }
+    }
+
+    private fun buildBluetoothPanel(panel: LinearLayout) {
+        val adapter = runCatching { getSystemService(BluetoothManager::class.java)?.adapter }.getOrNull()
+        val switch = Switch(this).apply {
+            text = "启用蓝牙"
+            setTextColor(0xFFE8EDF5.toInt())
+            textSize = 12f
+            isChecked = runCatching { adapter?.isEnabled == true }.getOrDefault(false)
+        }
+        switch.setOnCheckedChangeListener { _, enabled ->
+            switch.isEnabled = false
+            val primary = if (enabled) "cmd bluetooth_manager enable" else "cmd bluetooth_manager disable"
+            val fallback = if (enabled) "svc bluetooth enable" else "svc bluetooth disable"
+            runQuickSettingsCommand(listOf(primary, fallback)) { success ->
+                switch.isEnabled = true
+                if (success) switch.isChecked = enabled
+                else {
+                    switch.isChecked = runCatching { adapter?.isEnabled == true }.getOrDefault(!enabled)
+                    Toast.makeText(this, "蓝牙设置失败；请确认系统支持该命令且 Shizuku 已授权", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        panel.addView(switch, LinearLayout.LayoutParams(-1, dp(42)))
+        bluetoothDevicesText = TextView(this).apply {
+            setTextColor(0xFFE4EAF2.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        panel.addView(bluetoothDevicesText, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+        refreshBluetoothBatteryIndicator()
+        addPanelAction(panel, "打开系统蓝牙设置") {
+            launchSettingsOnDesktop(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+        }
+    }
+
+    private fun addPanelLabel(panel: LinearLayout, value: String) {
+        panel.addView(TextView(this).apply {
+            text = value
+            setTextColor(0xFFE4EAF2.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER_VERTICAL
+        }, LinearLayout.LayoutParams(-1, dp(20)))
+    }
+
+    private fun addPanelAction(panel: LinearLayout, label: String, action: () -> Unit) {
+        val button = TextView(this).apply {
+            text = label
+            setTextColor(0xFF9CCAFF.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            setOnClickListener { action() }
+        }
+        panel.addView(button, LinearLayout.LayoutParams(-1, dp(30)))
+    }
+
+    private fun launchSettingsOnDesktop(intent: Intent) {
+        dismissQuickSettingsPanel()
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            val options = ActivityOptions.makeBasic().apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) setLaunchDisplayId(desktopDisplayId)
+            }
+            startActivity(intent, options.toBundle())
+        } catch (error: Throwable) {
+            Log.w("DesktopShell", "Unable to open requested system settings", error)
+            Toast.makeText(this, "系统设置页面不可用", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun runQuickSettingsCommand(commands: List<String>, onComplete: (Boolean) -> Unit) {
+        lifecycleScope.launch {
+            val success = withContext(Dispatchers.IO) {
+                commands.any { executeQuickSettingsShell(it) }
+            }
+            if (!isFinishing && !isDestroyed) onComplete(success)
+        }
+    }
+
+    private fun executeQuickSettingsShell(command: String): Boolean {
+        if (!runCatching { Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED }
+                .getOrDefault(false)) return false
+        return runCatching {
+            val output = runShizuku("$command 2>&1; rc=\$?; echo __VD_EXIT__\$rc")
+            val exit = output.lineSequence().lastOrNull { it.startsWith("__VD_EXIT__") }
+                ?.removePrefix("__VD_EXIT__")?.trim()?.toIntOrNull()
+            exit == 0
+        }.onFailure { Log.w("DesktopShell", "Shizuku command failed: $command", it) }.getOrDefault(false)
+    }
+
+    private class BubbleTailView(context: Context, private val requestedTipX: Float) : View(context) {
+        private val density = resources.displayMetrics.density
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xF2262D38.toInt()
+            style = Paint.Style.FILL
+        }
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val halfBase = 13f * density
+            val tipX = requestedTipX.coerceIn(halfBase, (width - halfBase).coerceAtLeast(halfBase))
+            val path = android.graphics.Path().apply {
+                moveTo(tipX - halfBase, 0f)
+                lineTo(tipX + halfBase, 0f)
+                lineTo(tipX, height.toFloat())
+                close()
+            }
+            canvas.drawPath(path, paint)
+        }
+    }
+
     private fun currentDockClockText(): String =
         java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
 
@@ -468,6 +1024,11 @@ class DesktopShellActivity : ComponentActivity() {
         Log.w("DesktopShell", "onDestroy: shell is actually being destroyed; releasing child windows")
         // Release desktop-window resources only when the shell Activity is truly destroyed.
         closeAppDrawer()
+        dismissQuickSettingsPanel()
+        brightnessWriteJob?.cancel()
+        unregisterDockSystemStatusReceiver()
+        dockStatusIcons.clear()
+        dockStatusStrip = null
         taskbarMonitorJob?.cancel()
         taskbarMonitorJob = null
         dockClockJob?.cancel()
@@ -2610,6 +3171,12 @@ class DesktopShellActivity : ComponentActivity() {
         }
         val params = dockOverlayParams ?: return false
         val targetDisplay = display ?: return false
+        val panelParams = quickPanelParams
+        if (quickPanelRoot != null && panelParams != null) {
+            val insidePanel = x >= panelParams.x && x < panelParams.x + panelParams.width &&
+                y >= panelParams.y && y < panelParams.y + panelParams.height
+            if (insidePanel) return false
+        }
         val top = targetDisplay.height - params.height - params.y
         val inside = x >= params.x && x < params.x + params.width &&
             y >= top && y < top + params.height
@@ -2644,6 +3211,7 @@ class DesktopShellActivity : ComponentActivity() {
 
     private fun hideDockOverlay() {
         if (!dockOverlayAttached) return
+        dismissQuickSettingsPanel()
         // Dock is the owner of the desktop interactive surface. When it hides,
         // dismiss every transient UI that belongs to it as well.
         runCatching { closeAppDrawer() }

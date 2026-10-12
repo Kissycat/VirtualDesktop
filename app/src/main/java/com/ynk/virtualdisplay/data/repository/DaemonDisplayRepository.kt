@@ -506,9 +506,9 @@ class DaemonDisplayRepository(
         )
     }
 
-    override fun notifyVideoUserActivity(displayId: Int) {
+    override fun notifyVideoUserActivity(displayId: Int, freezeProtectionMs: Long) {
         if (currentStreamingDisplayId == displayId) {
-            videoController.notifyUserActivity()
+            videoController.notifyUserActivity(freezeProtectionMs)
         }
     }
 

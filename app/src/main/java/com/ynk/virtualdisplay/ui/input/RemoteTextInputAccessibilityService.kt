@@ -34,6 +34,11 @@ class RemoteTextInputAccessibilityService : AccessibilityService() {
 
         fun isConnected(): Boolean = connectedService != null
 
+        /** Expand the system notification shade on request from the desktop Dock. */
+        fun expandNotifications(): Boolean = callOnServiceThread(false) { service ->
+            service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS)
+        }
+
         /**
          * Detect placeholders before the ordinary SPACE key is sent. Some browser
          * editable nodes expose their hint as node.text, even while the edit buffer is

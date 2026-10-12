@@ -36,6 +36,7 @@ import com.ynk.virtualdisplay.data.repository.RecentAppHelper
 import com.ynk.virtualdisplay.manager.DisplayMetricsManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
@@ -50,6 +51,8 @@ class DisplayActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "DisplayActivity"
+        private const val IME_SHOW_FREEZE_PROTECTION_MS = 10_000L
+        private const val IME_SHOW_FREEZE_PROTECTION_DELAY_MS = 3_600L
         private val instances = ConcurrentHashMap<Int, WeakReference<DisplayActivity>>()
 
         // Set only by the floating WebRTC control. A temporary gateway disconnect
@@ -180,6 +183,7 @@ class DisplayActivity : ComponentActivity() {
     private lateinit var rootLayout: FrameLayout
     private lateinit var videoSurfaceView: VideoSurfaceView
     private lateinit var imeProxyView: RemoteImeProxyView
+    private var imeFreezeProtectionJob: Job? = null
     private lateinit var cursorOverlayView: DesktopCursorOverlayView
     private lateinit var statsOverlay: TextView
     private lateinit var controlPanel: DisplayControlPanel
@@ -455,6 +459,8 @@ class DisplayActivity : ComponentActivity() {
                 override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean =
                     inputController.deleteSurroundingText(beforeLength, afterLength)
                 override fun onKeyboardDismissed() {
+                    imeFreezeProtectionJob?.cancel()
+                    imeFreezeProtectionJob = null
                     (application as? MyApplication)?.setImeBridgeActive(this@DisplayActivity, false)
                 }
             })
@@ -1039,6 +1045,13 @@ class DisplayActivity : ComponentActivity() {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
 
         if (willEnable) {
+            imeFreezeProtectionJob?.cancel()
+            // Wake the stream immediately and guard the initial 2.6s transition. Start
+            // the full ten-second freeze-protection window only after the IME has had
+            // time to create its floating window and settle its first layout.
+            remoteDisplayId?.let { displayId ->
+                repository.notifyVideoUserActivity(displayId, IME_SHOW_FREEZE_PROTECTION_DELAY_MS)
+            }
             // The soft-input mode was fixed before the video SurfaceView was created;
             // opening the IME must not mutate window attributes or surface geometry.
             imeProxyView.requestKeyboardInput(true)
@@ -1051,8 +1064,20 @@ class DisplayActivity : ComponentActivity() {
                 imm.restartInput(imeProxyView)
                 @Suppress("DEPRECATION")
                 imm.showSoftInput(imeProxyView, InputMethodManager.SHOW_IMPLICIT)
+                // Start the requested ten-second protection timer from the actual IME
+                // show request, not from the earlier toolbar click.
+                val displayId = remoteDisplayId ?: return@post
+                imeFreezeProtectionJob?.cancel()
+                imeFreezeProtectionJob = lifecycleScope.launch {
+                    delay(IME_SHOW_FREEZE_PROTECTION_DELAY_MS)
+                    if (imeProxyView.isKeyboardActive() && !isFinishing && !isDestroyed) {
+                        repository.notifyVideoUserActivity(displayId, IME_SHOW_FREEZE_PROTECTION_MS)
+                    }
+                }
             }
         } else {
+            imeFreezeProtectionJob?.cancel()
+            imeFreezeProtectionJob = null
             // Request IME dismissal while the proxy is still the served editor, then
             // release view focus. Reversing this order can leave some CJK IMEs bound
             // to a stale InputConnection until the next keyboard toggle.
@@ -1064,6 +1089,8 @@ class DisplayActivity : ComponentActivity() {
     }
 
     private fun closeImeBridge() {
+        imeFreezeProtectionJob?.cancel()
+        imeFreezeProtectionJob = null
         if (::imeProxyView.isInitialized) {
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
             imm?.hideSoftInputFromWindow(imeProxyView.windowToken, 0)
